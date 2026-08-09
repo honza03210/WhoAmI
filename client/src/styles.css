@@ -153,6 +153,19 @@ code {
   cursor: default;
 }
 
+/* Sits in the header, so it stays quiet until reached for. */
+.chip.is-leave {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--surface-hover);
+  color: var(--muted);
+}
+
+.chip.is-leave:hover {
+  background: var(--danger);
+  box-shadow: none;
+  color: #fff;
+}
+
 /* Dashed, because it opens a file picker rather than selecting something that already exists. */
 .chip.is-upload {
   background: transparent;
@@ -502,8 +515,61 @@ code {
   border-left-color: var(--team-b);
 }
 
-.result p {
+.result p,
+.turn p {
   margin: 6px 0 0;
+}
+
+.turn p {
+  font-size: 13px;
+}
+
+.guesses {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.guess {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 14px;
+}
+
+.guess-verdict {
+  margin-left: auto;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+}
+
+.guess.is-right .guess-verdict {
+  color: #3ba55d;
+}
+
+.guess.is-wrong .guess-verdict {
+  color: var(--danger);
+}
+
+/* Offering the other team their turn back, and being honest about what it costs. */
+.play-on {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.play-on p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 60ch;
 }
 
 /* The one thing on screen the rest of the team must not read over your shoulder. */

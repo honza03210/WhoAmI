@@ -37,20 +37,37 @@ export type Answer = 'yes' | 'no';
 /** One row of the public question log. Both teams see every entry. */
 export interface QuestionEntry {
   id: number;
-  /** The team that asked; the other team's leader is the one who answers. */
+  /**
+   * A turn spent asking, or handed straight over. Passing exists because everyone is in a voice
+   * channel: a leader who has already got their answer out loud has nothing to type.
+   */
+  kind: 'question' | 'pass';
+  /** The team whose turn it was; the other team's leader is the one who answers. */
   askedBy: TeamId;
+  /** Empty for a pass. */
   text: string;
-  /** null while the opposing leader is still deciding. */
+  /** null while the opposing leader is still deciding, and always null for a pass. */
   answer: Answer | null;
 }
 
 export const MAX_QUESTION_LENGTH = 200;
 
+export interface GameGuess {
+  team: TeamId;
+  characterId: string;
+  correct: boolean;
+}
+
 export interface GameOutcome {
-  winner: TeamId;
-  /** A team wins either by naming the opponent's character or by the opponent naming wrong. */
-  reason: 'correct_guess' | 'wrong_guess';
-  guess: { team: TeamId; characterId: string; correct: boolean };
+  /** null when both teams named the wrong character. */
+  winner: TeamId | null;
+  /**
+   * `wrong_guess` is a win by default: one team named wrong and the other never had to try.
+   * It stops applying the moment the second team plays their own attempt out. `abandoned` means
+   * a team emptied out mid-game and there was nobody left to play it.
+   */
+  reason: 'correct_guess' | 'wrong_guess' | 'draw' | 'abandoned';
+  guesses: GameGuess[];
 }
 
 /**
@@ -69,6 +86,12 @@ export interface GameState {
   stage: 'asking' | 'answering';
   log: QuestionEntry[];
   nextQuestionId: number;
+  /**
+   * In the order they were made. A team that has guessed is out of the running — it can still
+   * answer, because it holds the character the other team is hunting, but it cannot ask or guess
+   * again.
+   */
+  guesses: GameGuess[];
   outcome: GameOutcome | null;
 }
 
@@ -89,6 +112,9 @@ export interface GameView {
   /** Both characters, once the game is over and there is nothing left to protect. */
   reveal: Record<TeamId, string> | null;
   log: QuestionEntry[];
+  guesses: GameGuess[];
+  /** True while one team has guessed and the other could still be sent back in to finish. */
+  canPlayOn: boolean;
   outcome: GameOutcome | null;
 }
 
@@ -106,6 +132,23 @@ export const CUSTOM_PACK_MAX = 40;
 export const CUSTOM_PHOTO_MAX_BYTES = 128 * 1024;
 
 /**
+ * What the uploader's browser could actually encode.
+ *
+ * WebP is preferred and is what the build script produces, but `canvas.toBlob` silently ignores
+ * a type it cannot encode, so a browser without WebP output would otherwise produce PNGs far too
+ * large to store. JPEG is the universal floor; the pack records which one it holds so the files
+ * can be named and served honestly.
+ */
+export type PackImageFormat = 'webp' | 'jpeg';
+
+export const PACK_IMAGE_EXTENSION: Record<PackImageFormat, string> = { webp: 'webp', jpeg: 'jpg' };
+export const PACK_IMAGE_MIME: Record<PackImageFormat, string> = { webp: 'image/webp', jpeg: 'image/jpeg' };
+
+export function isPackImageFormat(value: unknown): value is PackImageFormat {
+  return value === 'webp' || value === 'jpeg';
+}
+
+/**
  * A board of photos uploaded by the host, living in the room rather than on the asset layer.
  *
  * Public to everyone in the room — these are the faces on the board. The `token` is random so
@@ -115,6 +158,7 @@ export const CUSTOM_PHOTO_MAX_BYTES = 128 * 1024;
 export interface CustomPack {
   token: string;
   name: string;
+  format: PackImageFormat;
   characters: { id: string; name: string }[];
 }
 
@@ -158,10 +202,13 @@ export type ClientMessage =
   | { type: 'selectPack'; packId: string }
   | { type: 'startGame' }
   | { type: 'askQuestion'; text: string }
+  | { type: 'passTurn' }
   | { type: 'answerQuestion'; answer: Answer }
   | { type: 'flipTile'; characterId: string; down: boolean }
   | { type: 'resetFlips' }
   | { type: 'submitGuess'; characterId: string }
+  | { type: 'playOn' }
+  | { type: 'playAgain' }
   | { type: 'rematch' }
   | { type: 'ping' };
 
@@ -212,6 +259,8 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       const text = message['text'].replace(/\s+/g, ' ').trim();
       return text.length > 0 && text.length <= MAX_QUESTION_LENGTH ? { type: 'askQuestion', text } : null;
     }
+    case 'passTurn':
+      return { type: 'passTurn' };
     case 'answerQuestion':
       return message['answer'] === 'yes' || message['answer'] === 'no'
         ? { type: 'answerQuestion', answer: message['answer'] }
@@ -226,6 +275,10 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       return isCharacterId(message['characterId'])
         ? { type: 'submitGuess', characterId: message['characterId'] }
         : null;
+    case 'playOn':
+      return { type: 'playOn' };
+    case 'playAgain':
+      return { type: 'playAgain' };
     case 'rematch':
       return { type: 'rematch' };
     case 'ping':

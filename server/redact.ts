@@ -16,6 +16,7 @@
 
 import type { GameState, GameView, RoomState, RoomView, TeamId } from './protocol';
 import { startBlockers } from './lobby';
+import { teamStillToGuess } from './game';
 
 export function viewFor(state: RoomState, userId: string): RoomView {
   const member = state.members.find((candidate) => candidate.userId === userId);
@@ -30,7 +31,7 @@ export function viewFor(state: RoomState, userId: string): RoomView {
     customPack: state.customPack,
     leaders: state.leaders,
     members: state.members,
-    game: state.game ? gameViewFor(state.game, team, isLeader) : null,
+    game: state.game ? gameViewFor(state.game, team, isLeader, canPlayOn(state)) : null,
     you: {
       userId,
       team,
@@ -41,7 +42,20 @@ export function viewFor(state: RoomState, userId: string): RoomView {
   };
 }
 
-function gameViewFor(game: GameState, team: TeamId | null, isLeader: boolean): GameView {
+/**
+ * Whether the game can be reopened for the team that has not guessed.
+ *
+ * Needs the members, not just the game: offering to send a team back in is pointless once they
+ * have all closed the activity, which is exactly how an abandoned game ends up here.
+ */
+function canPlayOn(state: RoomState): boolean {
+  if (!state.game?.outcome) return false;
+
+  const remaining = teamStillToGuess(state.game);
+  return remaining !== null && state.members.some((member) => member.team === remaining && member.connected);
+}
+
+function gameViewFor(game: GameState, team: TeamId | null, isLeader: boolean, playable: boolean): GameView {
   // Nothing is worth hiding once the game is decided, and the reveal is the payoff.
   const over = game.outcome !== null;
 
@@ -52,6 +66,9 @@ function gameViewFor(game: GameState, team: TeamId | null, isLeader: boolean): G
     yourSecret: team !== null && isLeader ? game.secrets[team] : null,
     reveal: over ? game.secrets : null,
     log: game.log,
+    // Public: a leader names their guess out loud, and it says nothing about their own secret.
+    guesses: game.guesses,
+    canPlayOn: playable,
     outcome: game.outcome,
   };
 }

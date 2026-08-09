@@ -14,7 +14,10 @@ import {
   CUSTOM_PACK_MAX,
   CUSTOM_PACK_MIN,
   CUSTOM_PHOTO_MAX_BYTES,
+  PACK_IMAGE_EXTENSION,
+  PACK_IMAGE_MIME,
   type CustomPack,
+  type PackImageFormat,
 } from './protocol';
 
 /** Storage key holding the in-flight upload, if any. */
@@ -52,16 +55,21 @@ export function isValidToken(value: string): boolean {
 }
 
 /** Character ids and the two file names built from them; see shared/naming.ts for the slug rules. */
-export function tileFile(characterId: string): string {
-  return `${characterId}.webp`;
+export function tileFile(characterId: string, format: PackImageFormat = 'webp'): string {
+  return `${characterId}.${PACK_IMAGE_EXTENSION[format]}`;
 }
 
-export function fullFile(characterId: string): string {
-  return `${characterId}@full.webp`;
+export function fullFile(characterId: string, format: PackImageFormat = 'webp'): string {
+  return `${characterId}@full.${PACK_IMAGE_EXTENSION[format]}`;
 }
 
 export function isValidFile(file: string): boolean {
-  return /^[a-z0-9-]{1,64}(@full)?\.webp$/.test(file);
+  return /^[a-z0-9-]{1,64}(@full)?\.(webp|jpg)$/.test(file);
+}
+
+/** Served from the stored name, so a JPEG pack is not labelled as WebP. */
+export function contentTypeFor(file: string): string {
+  return file.endsWith('.jpg') ? PACK_IMAGE_MIME.jpeg : PACK_IMAGE_MIME.webp;
 }
 
 export type DraftResult<T> = { ok: true; value: T } | { ok: false; status: number; error: string };
@@ -86,6 +94,7 @@ export function commitDraft(
   draft: PackDraft,
   actorId: string,
   characters: { id: string; name: string }[],
+  format: PackImageFormat = 'webp',
 ): DraftResult<CustomPack> {
   if (draft.ownerId !== actorId) return fail(403, 'not_your_upload');
   if (characters.length < CUSTOM_PACK_MIN || characters.length > CUSTOM_PACK_MAX) {
@@ -98,7 +107,9 @@ export function commitDraft(
     if (seen.has(character.id)) return fail(400, 'duplicate_character');
     seen.add(character.id);
 
-    for (const file of [tileFile(character.id), fullFile(character.id)]) {
+    // Every photo must be present *in the declared format*, so a client cannot mix encodings
+    // and leave the board half unreadable.
+    for (const file of [tileFile(character.id, format), fullFile(character.id, format)]) {
       if (!draft.stored.includes(file)) return fail(400, 'missing_photo');
     }
   }
@@ -108,6 +119,7 @@ export function commitDraft(
     value: {
       token: draft.token,
       name: draft.name.trim().slice(0, 40) || 'Custom',
+      format,
       characters: characters.map((character) => ({
         id: character.id,
         name: character.name.trim().slice(0, 40) || character.id,

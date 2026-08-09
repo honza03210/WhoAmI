@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { apply, initialRoom, memberJoined } from '../server/lobby';
+import { apply, initialRoom, memberJoined, memberLeft } from '../server/lobby';
 import { viewFor } from '../server/redact';
 import type { RoomState, TeamId } from '../server/protocol';
 
@@ -91,7 +91,7 @@ describe('asking and answering', () => {
     const state = must(startedGame(), 'leaderA', { type: 'askQuestion', text: 'Do they wear glasses?' });
     expect(game(state).stage).toBe('answering');
     expect(game(state).log).toEqual([
-      { id: 1, askedBy: 'a', text: 'Do they wear glasses?', answer: null },
+      { id: 1, kind: 'question', askedBy: 'a', text: 'Do they wear glasses?', answer: null },
     ]);
     // Asking does not end the turn; answering does.
     expect(game(state).activeTeam).toBe('a');
@@ -140,6 +140,43 @@ describe('asking and answering', () => {
 
   it('refuses an answer when nothing was asked', () => {
     expect(rejection(startedGame(), 'leaderB', { type: 'answerQuestion', answer: 'yes' }).code).toBe('no_question');
+  });
+});
+
+describe('passing', () => {
+  it('hands the turn over and says so in the log', () => {
+    const state = must(startedGame(), 'leaderA', { type: 'passTurn' });
+
+    expect(game(state).activeTeam).toBe('b');
+    expect(game(state).stage).toBe('asking');
+    expect(game(state).log).toEqual([{ id: 1, kind: 'pass', askedBy: 'a', text: '', answer: null }]);
+  });
+
+  it('is leader-only and turn-only', () => {
+    const state = startedGame();
+    expect(rejection(state, 'redFan', { type: 'passTurn' }).code).toBe('not_leader');
+    expect(rejection(state, 'leaderB', { type: 'passTurn' }).code).toBe('not_your_turn');
+  });
+
+  it('cannot dodge an open question', () => {
+    const state = must(startedGame(), 'leaderA', { type: 'askQuestion', text: 'Glasses?' });
+    expect(rejection(state, 'leaderA', { type: 'passTurn' }).code).toBe('awaiting_answer');
+  });
+
+  it('does not stall the game when the other team is already out', () => {
+    let state = must(startedGame(), 'leaderA', { type: 'submitGuess', characterId: 'dee' });
+    state = must(state, 'leaderA', { type: 'playOn' });
+    expect(rejection(state, 'leaderB', { type: 'passTurn' }).code).toBe('nobody_to_pass_to');
+  });
+
+  it('keeps numbering the log across passes and questions', () => {
+    let state = must(startedGame(), 'leaderA', { type: 'passTurn' });
+    state = must(state, 'leaderB', { type: 'askQuestion', text: 'Glasses?' });
+
+    expect(game(state).log.map((entry) => [entry.id, entry.kind])).toEqual([
+      [1, 'pass'],
+      [2, 'question'],
+    ]);
   });
 });
 
@@ -193,11 +230,11 @@ describe('guessing', () => {
     expect(game(state).outcome).toEqual({
       winner: 'a',
       reason: 'correct_guess',
-      guess: { team: 'a', characterId: 'fox', correct: true },
+      guesses: [{ team: 'a', characterId: 'fox', correct: true }],
     });
   });
 
-  it('hands the game to the other team when the guess is wrong', () => {
+  it('hands the game to the other team when the guess is wrong and they never reply', () => {
     const state = must(startedGame(), 'leaderA', { type: 'submitGuess', characterId: 'dee' });
 
     expect(state.phase).toBe('endgame');
@@ -219,6 +256,165 @@ describe('guessing', () => {
     const state = must(startedGame(), 'leaderA', { type: 'submitGuess', characterId: 'fox' });
     expect(rejection(state, 'leaderB', { type: 'askQuestion', text: 'Again?' }).code).toBe('game_over');
     expect(rejection(state, 'leaderB', { type: 'flipTile', characterId: 'ada', down: true }).code).toBe('game_over');
+  });
+});
+
+describe('playing it through', () => {
+  /** Red has guessed; Blue has not had its attempt yet. */
+  const afterRedGuesses = (characterId: string) =>
+    must(startedGame(), 'leaderA', { type: 'submitGuess', characterId });
+
+  it('offers the other team their turn back', () => {
+    const finished = afterRedGuesses('dee');
+    expect(viewFor(finished, 'leaderB').game?.canPlayOn).toBe(true);
+
+    const reopened = must(finished, 'leaderA', { type: 'playOn' });
+    expect(reopened.phase).toBe('in_progress');
+    expect(game(reopened).outcome).toBeNull();
+    // Blue is on, and it is a fresh turn rather than a half-finished one.
+    expect(game(reopened)).toMatchObject({ activeTeam: 'b', stage: 'asking' });
+  });
+
+  it('keeps the log, the boards and both secrets across the reopen', () => {
+    let state = must(startedGame(), 'leaderA', { type: 'flipTile', characterId: 'bob', down: true });
+    state = must(state, 'leaderA', { type: 'askQuestion', text: 'Glasses?' });
+    state = must(state, 'leaderB', { type: 'answerQuestion', answer: 'yes' });
+    state = must(state, 'leaderB', { type: 'flipTile', characterId: 'dee', down: true });
+    state = must(state, 'leaderB', { type: 'submitGuess', characterId: 'cy' });
+    state = must(state, 'leaderA', { type: 'playOn' });
+
+    expect(game(state).log).toHaveLength(1);
+    expect(game(state).flipped).toEqual({ a: ['bob'], b: ['dee'] });
+    expect(game(state).secrets).toEqual({ a: 'ada', b: 'fox' });
+    expect(viewFor(state, 'leaderA').game?.yourSecret).toBe('ada');
+  });
+
+  it('lets the team that already guessed answer but not ask or guess again', () => {
+    const reopened = must(afterRedGuesses('dee'), 'leaderA', { type: 'playOn' });
+
+    expect(rejection(reopened, 'leaderA', { type: 'askQuestion', text: 'Another?' }).code).toBe('not_your_turn');
+    expect(rejection(reopened, 'leaderA', { type: 'submitGuess', characterId: 'eve' }).code).toBe('not_your_turn');
+
+    // But Red still holds the character Blue is hunting, so Red must still answer.
+    const asked = must(reopened, 'leaderB', { type: 'askQuestion', text: 'Glasses?' });
+    const answered = must(asked, 'leaderA', { type: 'answerQuestion', answer: 'no' });
+    expect(game(answered).log).toEqual([{ id: 1, kind: 'question', askedBy: 'b', text: 'Glasses?', answer: 'no' }]);
+  });
+
+  it('does not pass the turn back to a team that has finished', () => {
+    let state = must(afterRedGuesses('dee'), 'leaderA', { type: 'playOn' });
+    state = must(state, 'leaderB', { type: 'askQuestion', text: 'Glasses?' });
+    state = must(state, 'leaderA', { type: 'answerQuestion', answer: 'yes' });
+
+    // Normally answering takes the turn; Red is out, so Blue keeps going.
+    expect(game(state).activeTeam).toBe('b');
+    expect(game(state).stage).toBe('asking');
+  });
+
+  it('gives the win to the team that guesses right second', () => {
+    let state = must(afterRedGuesses('dee'), 'leaderA', { type: 'playOn' });
+    state = must(state, 'leaderB', { type: 'submitGuess', characterId: 'ada' });
+
+    expect(state.phase).toBe('endgame');
+    expect(game(state).outcome).toMatchObject({ winner: 'b', reason: 'correct_guess' });
+  });
+
+  it('is a draw when both teams name the wrong character', () => {
+    let state = must(afterRedGuesses('dee'), 'leaderA', { type: 'playOn' });
+    state = must(state, 'leaderB', { type: 'submitGuess', characterId: 'eve' });
+
+    expect(game(state).outcome).toMatchObject({ winner: null, reason: 'draw' });
+    expect(game(state).outcome?.guesses).toHaveLength(2);
+  });
+
+  it('keeps the win with whoever got there first', () => {
+    // Red is right, Blue plays on and is also right — Red still took it.
+    let state = must(afterRedGuesses('fox'), 'leaderA', { type: 'playOn' });
+    state = must(state, 'leaderB', { type: 'submitGuess', characterId: 'ada' });
+
+    expect(game(state).outcome).toMatchObject({ winner: 'a', reason: 'correct_guess' });
+  });
+
+  it('cannot be reopened once both teams have guessed', () => {
+    let state = must(afterRedGuesses('dee'), 'leaderA', { type: 'playOn' });
+    state = must(state, 'leaderB', { type: 'submitGuess', characterId: 'eve' });
+
+    expect(viewFor(state, 'leaderA').game?.canPlayOn).toBe(false);
+    expect(rejection(state, 'leaderA', { type: 'playOn' }).code).toBe('nothing_to_finish');
+  });
+
+  it('is host-only and endgame-only', () => {
+    expect(rejection(afterRedGuesses('dee'), 'leaderB', { type: 'playOn' }).code).toBe('not_host');
+    expect(rejection(startedGame(), 'leaderA', { type: 'playOn' }).code).toBe('not_finished');
+  });
+});
+
+describe('a team walking out', () => {
+  it('ends a running game when the last player on a side leaves', () => {
+    let state = startedGame();
+    state = memberLeft(state, 'leaderB');
+    expect(state.phase).toBe('in_progress');
+
+    // blueFan was the last one holding Blue up.
+    state = memberLeft(state, 'blueFan');
+    expect(state.phase).toBe('endgame');
+    expect(game(state).outcome).toMatchObject({ winner: 'a', reason: 'abandoned' });
+  });
+
+  it('settles on the first team to walk out, whatever happens after', () => {
+    let state = startedGame();
+    state = memberLeft(state, 'leaderA');
+    state = memberLeft(state, 'redFan');
+    expect(game(state).outcome).toMatchObject({ winner: 'b', reason: 'abandoned' });
+
+    // Blue leaving afterwards does not reopen or rewrite a game that is already over.
+    state = memberLeft(state, 'leaderB');
+    state = memberLeft(state, 'blueFan');
+    expect(state.phase).toBe('endgame');
+    expect(game(state).outcome).toMatchObject({ winner: 'b', reason: 'abandoned' });
+  });
+
+  it('does not end a game over a spectator leaving', () => {
+    const state = memberLeft(startedGame(), 'watcher');
+    expect(state.phase).toBe('in_progress');
+  });
+
+  it('does not offer to reopen a game nobody is left to play', () => {
+    let state = startedGame();
+    state = memberLeft(state, 'leaderB');
+    state = memberLeft(state, 'blueFan');
+
+    // Blue never guessed, but there is no Blue left to send back in.
+    expect(viewFor(state, 'leaderA').game?.canPlayOn).toBe(false);
+  });
+});
+
+describe('playing again', () => {
+  const finished = () => must(startedGame(), 'leaderA', { type: 'submitGuess', characterId: 'fox' });
+
+  it('deals a fresh game with the same teams and board', () => {
+    const again = must(finished(), 'leaderA', { type: 'playAgain' });
+
+    expect(again.phase).toBe('in_progress');
+    expect(game(again)).toMatchObject({ activeTeam: 'a', stage: 'asking', log: [], guesses: [], outcome: null });
+    expect(game(again).characters).toEqual(BOARD);
+    expect(game(again).flipped).toEqual({ a: [], b: [] });
+    // Same line-up — nobody has to pick a team or ready up again.
+    expect(again.leaders).toEqual({ a: 'leaderA', b: 'leaderB' });
+    expect(again.packId).toBe('demo');
+  });
+
+  it('is host-only and endgame-only', () => {
+    expect(rejection(finished(), 'leaderB', { type: 'playAgain' }).code).toBe('not_host');
+    expect(rejection(startedGame(), 'leaderA', { type: 'playAgain' }).code).toBe('not_finished');
+  });
+
+  it('is refused when a team has nobody left', () => {
+    let state = finished();
+    state = memberLeft(state, 'leaderB');
+    state = memberLeft(state, 'blueFan');
+
+    expect(rejection(state, 'leaderA', { type: 'playAgain' }).code).toBe('team_empty');
   });
 });
 
@@ -302,7 +498,7 @@ describe('redaction', () => {
     const state = midGame();
     for (const userId of ['leaderA', 'redFan', 'leaderB', 'blueFan', 'watcher']) {
       expect(viewFor(state, userId).game?.log).toEqual([
-        { id: 1, askedBy: 'a', text: 'Glasses?', answer: 'yes' },
+        { id: 1, kind: 'question', askedBy: 'a', text: 'Glasses?', answer: 'yes' },
       ]);
     }
   });

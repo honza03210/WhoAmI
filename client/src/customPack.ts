@@ -11,7 +11,10 @@ import {
   CUSTOM_PACK_MAX,
   CUSTOM_PACK_MIN,
   CUSTOM_PHOTO_MAX_BYTES,
+  PACK_IMAGE_EXTENSION,
+  PACK_IMAGE_MIME,
   type CustomPack,
+  type PackImageFormat,
 } from '../../server/protocol';
 import { displayNameFromFile, uniqueId } from '../../shared/naming';
 import { apiPath } from './discord';
@@ -81,6 +84,10 @@ export async function uploadCustomPack(
   const base = apiPath(`/api/pack/${encodeURIComponent(instanceId)}`);
   const auth = `session=${encodeURIComponent(session)}`;
 
+  // Settled before any photo is touched: it decides both the encoding and the file names.
+  const format = await detectFormat();
+  const extension = PACK_IMAGE_EXTENSION[format];
+
   const { token } = await postJson<{ token: string }>(`${base}/begin?${auth}`, {
     name: packNameFrom(files),
   });
@@ -95,10 +102,10 @@ export async function uploadCustomPack(
 
     const bitmap = await loadImage(file);
     try {
-      const tile = await encodeSquare(bitmap, TILE_SIZE, name);
-      const full = await encodeSquare(bitmap, FULL_SIZE, name);
-      await putPhoto(`${base}/${token}/add?file=${id}.webp&${auth}`, tile);
-      await putPhoto(`${base}/${token}/add?file=${id}%40full.webp&${auth}`, full);
+      const tile = await encodeSquare(bitmap, TILE_SIZE, name, format);
+      const full = await encodeSquare(bitmap, FULL_SIZE, name, format);
+      await putPhoto(`${base}/${token}/add?file=${id}.${extension}&${auth}`, tile);
+      await putPhoto(`${base}/${token}/add?file=${id}%40full.${extension}&${auth}`, full);
     } finally {
       bitmap.close();
     }
@@ -108,7 +115,10 @@ export async function uploadCustomPack(
   }
 
   onProgress({ done: files.length, total: files.length, label: 'Publishing the board…' });
-  const { pack } = await postJson<{ pack: CustomPack }>(`${base}/${token}/commit?${auth}`, { characters });
+  const { pack } = await postJson<{ pack: CustomPack }>(`${base}/${token}/commit?${auth}`, {
+    characters,
+    format,
+  });
   return pack;
 }
 
@@ -135,12 +145,17 @@ async function loadImage(file: File): Promise<ImageBitmap> {
  * itself shrink — a slightly soft tile is better than a smaller one. Cropping rather than
  * letterboxing keeps faces filling the tile, which is the whole point of the board.
  */
-async function encodeSquare(bitmap: ImageBitmap, size: number, label: string): Promise<Blob> {
+async function encodeSquare(
+  bitmap: ImageBitmap,
+  size: number,
+  label: string,
+  format: PackImageFormat,
+): Promise<Blob> {
   let best: Blob | null = null;
 
   for (let dimension = size; dimension >= MIN_DIMENSION; dimension = Math.round(dimension * SHRINK_FACTOR)) {
     for (const quality of QUALITY_STEPS) {
-      const blob = await drawAndEncode(bitmap, dimension, quality);
+      const blob = await drawAndEncode(bitmap, dimension, quality, format);
       if (blob.size <= TARGET_BYTES) return blob;
       if (!best || blob.size < best.size) best = blob;
     }
@@ -153,7 +168,12 @@ async function encodeSquare(bitmap: ImageBitmap, size: number, label: string): P
   );
 }
 
-async function drawAndEncode(bitmap: ImageBitmap, size: number, quality: number): Promise<Blob> {
+async function drawAndEncode(
+  bitmap: ImageBitmap,
+  size: number,
+  quality: number,
+  format: PackImageFormat,
+): Promise<Blob> {
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
@@ -161,28 +181,62 @@ async function drawAndEncode(bitmap: ImageBitmap, size: number, quality: number)
   const context = canvas.getContext('2d');
   if (!context) throw new PackError('This browser cannot process images.');
 
+  // JPEG has no alpha, and an unpainted canvas composites as black; fill first so a transparent
+  // PNG source arrives on a white card rather than a black one.
+  if (format === 'jpeg') {
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, size, size);
+  }
+
   const side = Math.min(bitmap.width, bitmap.height);
   const left = (bitmap.width - side) / 2;
   const top = (bitmap.height - side) / 2;
   context.drawImage(bitmap, left, top, side, side, 0, 0, size, size);
 
-  const blob = await toBlob(canvas, quality);
-  // toBlob falls back to PNG for a type it can't encode, silently ignoring `quality` — which
-  // looks exactly like a photo that refuses to compress. Say what actually went wrong.
-  if (blob.type !== 'image/webp') {
-    throw new PackError('This browser cannot encode WebP images, so photos cannot be uploaded here.');
-  }
-  return blob;
+  return toBlob(canvas, PACK_IMAGE_MIME[format], quality);
 }
 
-function toBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+function toBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (blob) => (blob ? resolve(blob) : reject(new PackError('This browser could not encode the image.'))),
-      'image/webp',
+      type,
       quality,
     );
   });
+}
+
+/**
+ * Works out what this browser can actually produce, once per upload.
+ *
+ * `canvas.toBlob` does not report failure: asked for a type it cannot encode it quietly returns
+ * PNG, ignoring `quality` too — which shows up as photos that refuse to compress rather than as
+ * a missing feature. So the result is checked against the file's magic bytes rather than its
+ * `type` field, which some browsers leave empty.
+ */
+async function detectFormat(): Promise<PackImageFormat> {
+  const canvas = document.createElement('canvas');
+  canvas.width = 8;
+  canvas.height = 8;
+  const context = canvas.getContext('2d');
+  if (!context) throw new PackError('This browser cannot process images.');
+  context.fillRect(0, 0, 8, 8);
+
+  for (const format of ['webp', 'jpeg'] as const) {
+    const blob = await toBlob(canvas, PACK_IMAGE_MIME[format], 0.8);
+    if ((await sniff(blob)) === format) return format;
+  }
+  throw new PackError('This browser cannot encode images for upload.');
+}
+
+async function sniff(blob: Blob): Promise<PackImageFormat | 'other'> {
+  const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+  const ascii = String.fromCharCode(...header);
+
+  // "RIFF....WEBP" and the JPEG SOI marker.
+  if (ascii.startsWith('RIFF') && ascii.slice(8, 12) === 'WEBP') return 'webp';
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return 'jpeg';
+  return 'other';
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {

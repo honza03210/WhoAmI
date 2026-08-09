@@ -56,7 +56,10 @@ Worth knowing about the custom path:
 - **They are served by a random token**, not by room id, so knowing which voice channel a game was
   in is not enough to fetch the pictures.
 - **Encoding happens in the browser.** The Worker never sees a full-resolution photo, only the
-  small WebPs it stores, and the resize costs Cloudflare nothing.
+  small images it stores, and the resize costs Cloudflare nothing. WebP is used where the browser
+  can produce it and JPEG everywhere else — `canvas.toBlob` answers a type it cannot encode with
+  PNG rather than an error, so the result is checked against its magic bytes and the pack records
+  which format it actually holds.
 - Only the host can upload, only in the lobby, and publishing a new board clears everyone's ready
   state — a different board is a different game.
 
@@ -218,6 +221,40 @@ unparseable JSON as "not built yet" rather than trusting the status code.
 | 4 | Game loop: secrets, questions, tile flips, guessing, endgame | ✅ done |
 | 5 | Layout modes, mobile, spectators, reconnect, room cleanup | next |
 | 6 | Deploy and smoke test | |
+
+### Taking a turn
+
+A leader can ask a question, **Pass**, or name a character. Passing exists because everyone is in
+a voice channel: most questions get asked out loud, and a leader who already has their answer has
+nothing to type. The log records the pass so the turn order still reads back.
+
+### How a game ends
+
+On their own turn a leader can name a character instead of asking a question. That stops play at
+once and reveals both boards — but it also ends the game for a team that may have been one
+question away, so the endgame screen offers the host a **Let <team> finish** button.
+
+Reopening puts the other team back on the board alone: they ask, the team that already guessed
+still answers (it holds the character they are hunting), and their own guess closes the game for
+good. Then:
+
+| Guesses | Result |
+|---|---|
+| One team right | That team wins |
+| Both right | Whoever named it first wins |
+| One team wrong, the other never guessed | The other team wins by default |
+| Both wrong | A draw |
+
+So a wrong guess is still the classic penalty, and the offer to play on is a real decision rather
+than a formality: it is a chance to win it properly, at the risk of turning a default win into a
+draw. The screen says as much before the host clicks.
+
+From the result screen the host can **Play again** — same teams, same board, fresh characters, no
+ready-up — or go **Back to the lobby** to change the line-up or the pack.
+
+A game also ends if a team loses its last connected player: that is a walkover for whoever is
+left, and it stops the room waiting forever on a turn nobody can take. The **Leave** button in the
+header closes the activity, and leaving is what triggers this.
 
 ### The design constraint that shapes everything
 

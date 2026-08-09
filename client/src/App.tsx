@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientMessage, RoomView } from '../../server/protocol';
 import { CUSTOM_PACK_ID } from '../../server/protocol';
 import type { Connection } from './discord';
-import { connect, isEmbedded } from './discord';
+import { connect, isEmbedded, leaveActivity } from './discord';
 import type { PackManifest, PackSummary } from './packs';
 import { loadPack, loadPackIndex, manifestFromCustomPack } from './packs';
 import type { ConnectionStatus, RoomClient } from './net';
@@ -22,6 +22,7 @@ export function App() {
   const [view, setView] = useState<RoomView | null>(null);
   const [connection, setConnection] = useState<ConnectionStatus>('connecting');
   const [notice, setNotice] = useState<string | null>(null);
+  const [left, setLeft] = useState(false);
 
   const room = useRef<RoomClient | null>(null);
 
@@ -100,6 +101,17 @@ export function App() {
 
   const send = useCallback((message: ClientMessage) => room.current?.send(message), []);
 
+  /**
+   * Leaves the room first, then asks Discord to close the activity. Closing the socket is what
+   * actually takes the player out of the game, and it must not depend on Discord obliging.
+   */
+  const leave = useCallback(() => {
+    room.current?.close();
+    room.current = null;
+    setLeft(true);
+    if (status.phase === 'ready') leaveActivity(status.connection.sdk);
+  }, [status]);
+
   if (status.phase === 'connecting') {
     return <main className="centered">Connecting to Discord…</main>;
   }
@@ -114,6 +126,18 @@ export function App() {
 
   const { user, session } = status.connection;
 
+  if (left) {
+    return (
+      <main className="centered">
+        <h1>You left the game</h1>
+        <p className="muted">Close this window, or rejoin to pick up where the room is now.</p>
+        <button type="button" className="button is-primary" onClick={() => window.location.reload()}>
+          Rejoin
+        </button>
+      </main>
+    );
+  }
+
   return (
     <main>
       <header>
@@ -125,6 +149,9 @@ export function App() {
           <img src={user.avatarUrl} alt="" width={24} height={24} />
           {user.displayName}
         </span>
+        <button type="button" className="chip is-leave" onClick={leave}>
+          Leave
+        </button>
       </header>
 
       {notice && <p className="error notice">{notice}</p>}

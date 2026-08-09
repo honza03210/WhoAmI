@@ -17,6 +17,7 @@ import {
   DRAFT_KEY,
   checkPhoto,
   commitDraft,
+  contentTypeFor,
   draftHasExpired,
   isValidFile,
   isValidToken,
@@ -24,7 +25,13 @@ import {
   packStorage,
   type PackDraft,
 } from './customPack';
-import { CUSTOM_PACK_ID, parseClientMessage, type RoomState, type ServerMessage } from './protocol';
+import {
+  CUSTOM_PACK_ID,
+  isPackImageFormat,
+  parseClientMessage,
+  type RoomState,
+  type ServerMessage,
+} from './protocol';
 
 /** An abandoned room is cleared out rather than paying storage forever. */
 const IDLE_CLEANUP_MS = 6 * 60 * 60 * 1000;
@@ -164,7 +171,7 @@ export class GameRoom extends DurableObject<Env> {
 
       return new Response(bytes, {
         headers: {
-          'content-type': 'image/webp',
+          'content-type': contentTypeFor(file),
           // The token changes whenever the photos do, so a URL's content never changes.
           'cache-control': 'public, max-age=31536000, immutable',
         },
@@ -220,8 +227,14 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private async commitPack(request: Request, draft: PackDraft, actorId: string): Promise<Response> {
-    const body = (await readJson(request)) as { characters?: { id: string; name: string }[] };
-    const committed = commitDraft(draft, actorId, body?.characters ?? []);
+    const body = (await readJson(request)) as {
+      characters?: { id: string; name: string }[];
+      format?: unknown;
+    };
+    // Older clients uploaded WebP without saying so.
+    const format = isPackImageFormat(body?.format) ? body.format : 'webp';
+
+    const committed = commitDraft(draft, actorId, body?.characters ?? [], format);
     if (!committed.ok) return packError(committed.status, committed.error);
 
     // The board it replaces is now unreachable, so its photos go with it.

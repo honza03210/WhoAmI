@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ClientMessage, GameView, RoomView, TeamId } from '../../../server/protocol';
-import { MAX_QUESTION_LENGTH, TEAM_NAMES, otherTeam } from '../../../server/protocol';
+import { MAX_QUESTION_LENGTH, TEAM_IDS, TEAM_NAMES, otherTeam } from '../../../server/protocol';
 import type { PackManifest } from '../packs';
 import { packAsset } from '../packs';
 import { Board } from './Board';
@@ -44,7 +44,14 @@ export function Game({ view, pack, send }: GameProps) {
   return (
     <>
       {over && game.outcome ? (
-        <Result outcome={game.outcome} reveal={game.reveal} nameOf={nameOf} you={you} />
+        <Result
+          game={game}
+          outcome={game.outcome}
+          reveal={game.reveal}
+          nameOf={nameOf}
+          you={you}
+          send={send}
+        />
       ) : (
         <TurnBanner game={game} you={you} />
       )}
@@ -121,7 +128,11 @@ export function Game({ view, pack, send }: GameProps) {
 
       {over && view.you.isHost && (
         <section className="start-row">
-          <button type="button" className="button is-primary" onClick={() => send({ type: 'rematch' })}>
+          {/* Same teams, same board, fresh characters — nobody has to ready up again. */}
+          <button type="button" className="button is-primary" onClick={() => send({ type: 'playAgain' })}>
+            Play again
+          </button>
+          <button type="button" className="button is-secondary" onClick={() => send({ type: 'rematch' })}>
             Back to the lobby
           </button>
         </section>
@@ -162,9 +173,17 @@ function TurnBanner({ game, you }: { game: GameView; you: RoomView['you'] }) {
           : `${answering}'s leader is answering`
         : `Waiting for ${answering} to answer`;
 
+  // Set once a team has used its guess and is only still here to answer.
+  const youAreDone = you.team !== null && game.guesses.some((guess) => guess.team === you.team);
+
   return (
     <section className={`turn turn-${game.activeTeam}`}>
       <h2>{message}</h2>
+      {youAreDone && (
+        <p className="muted">
+          Your guess is in — you are answering only, while {TEAM_NAMES[game.activeTeam]} plays theirs out.
+        </p>
+      )}
     </section>
   );
 }
@@ -279,6 +298,10 @@ function Actions({
           Ask
         </button>
       </form>
+      {/* Most questions get asked out loud in voice; this hands the turn over without typing. */}
+      <button type="button" className="button" onClick={() => send({ type: 'passTurn' })}>
+        Pass
+      </button>
       <button type="button" className="button is-guess" onClick={onStartGuess}>
         Guess their character
       </button>
@@ -304,10 +327,16 @@ function QuestionLog({ log }: { log: GameView['log'] }) {
         {[...log].reverse().map((entry) => (
           <li key={entry.id} className={`log-entry log-${entry.askedBy}`}>
             <span className="log-team">{TEAM_NAMES[entry.askedBy]}</span>
-            <span className="log-text">{entry.text}</span>
-            <span className={entry.answer ? `log-answer is-${entry.answer}` : 'log-answer is-open'}>
-              {entry.answer ?? '…'}
-            </span>
+            {entry.kind === 'pass' ? (
+              <span className="log-text muted">passed — asked out loud</span>
+            ) : (
+              <>
+                <span className="log-text">{entry.text}</span>
+                <span className={entry.answer ? `log-answer is-${entry.answer}` : 'log-answer is-open'}>
+                  {entry.answer ?? '…'}
+                </span>
+              </>
+            )}
           </li>
         ))}
       </ol>
@@ -316,34 +345,64 @@ function QuestionLog({ log }: { log: GameView['log'] }) {
 }
 
 function Result({
+  game,
   outcome,
   reveal,
   nameOf,
   you,
+  send,
 }: {
+  game: GameView;
   outcome: NonNullable<GameView['outcome']>;
   reveal: GameView['reveal'];
   nameOf: (characterId: string) => string;
   you: RoomView['you'];
+  send: GameProps['send'];
 }) {
-  const winner = TEAM_NAMES[outcome.winner];
-  const guesser = TEAM_NAMES[outcome.guess.team];
-  const youWon = you.team === outcome.winner;
+  const youWon = outcome.winner !== null && you.team === outcome.winner;
+  const remaining = TEAM_IDS.find((team) => !outcome.guesses.some((guess) => guess.team === team));
 
   return (
-    <section className={`result result-${outcome.winner}`}>
+    <section className={outcome.winner ? `result result-${outcome.winner}` : 'result'}>
       <h2>
-        {winner} wins{you.team ? (youWon ? ' — that’s you' : '') : ''}
+        {outcome.winner === null
+          ? 'A draw — neither team found them'
+          : `${TEAM_NAMES[outcome.winner]} wins${you.team ? (youWon ? ' — that’s you' : '') : ''}`}
       </h2>
-      <p>
-        {outcome.reason === 'correct_guess'
-          ? `${guesser} named ${nameOf(outcome.guess.characterId)} and got it right.`
-          : `${guesser} guessed ${nameOf(outcome.guess.characterId)}, which was wrong.`}
-      </p>
+
+      <ul className="guesses">
+        {outcome.guesses.map((guess) => (
+          <li key={guess.team} className={guess.correct ? 'guess is-right' : 'guess is-wrong'}>
+            <span className="log-team">{TEAM_NAMES[guess.team]}</span>
+            <span>
+              said <strong>{nameOf(guess.characterId)}</strong>
+            </span>
+            <span className="guess-verdict">{guess.correct ? 'right' : 'wrong'}</span>
+          </li>
+        ))}
+      </ul>
+
       {reveal && (
         <p className="muted">
           {TEAM_NAMES.a} was {nameOf(reveal.a)}. {TEAM_NAMES.b} was {nameOf(reveal.b)}.
         </p>
+      )}
+
+      {/* A guess stops the game dead, which is hard on a team that was mid-deduction. */}
+      {game.canPlayOn && remaining && (
+        <div className="play-on">
+          <p>
+            {TEAM_NAMES[remaining]} never got their guess.{' '}
+            {outcome.reason === 'wrong_guess'
+              ? `They have won by default — playing on means naming a character for real, and getting it wrong makes it a draw.`
+              : `They can still play it through to see whether they had it too.`}
+          </p>
+          {you.isHost && (
+            <button type="button" className="button is-primary" onClick={() => send({ type: 'playOn' })}>
+              Let {TEAM_NAMES[remaining]} finish
+            </button>
+          )}
+        </div>
       )}
     </section>
   );

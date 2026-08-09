@@ -11,7 +11,7 @@
 
 import type { ClientMessage, Member, RoomState, TeamId } from './protocol';
 import { CUSTOM_PACK_ID, TEAM_IDS, TEAM_NAMES, isTeamId } from './protocol';
-import { applyGame, beginGame, type Outcome, type Pick, type Rejection } from './game';
+import { applyGame, beginGame, endIfTeamAbandoned, type Outcome, type Pick, type Rejection } from './game';
 
 export type { Outcome, Rejection };
 
@@ -109,7 +109,8 @@ export function memberLeft(state: RoomState, userId: string): RoomState {
       ? state.members.filter((member) => member.userId !== userId)
       : state.members.map((member) => (member.userId === userId ? { ...member, connected: false } : member));
 
-  return reconcile({ ...state, members });
+  // Losing the last player on a side ends the game — there is no turn anyone can take.
+  return endIfTeamAbandoned(reconcile({ ...state, members }));
 }
 
 /** Reasons the host can't start yet, in the order worth fixing them. */
@@ -154,12 +155,15 @@ export function apply(
       return accept(state);
 
     case 'askQuestion':
+    case 'passTurn':
     case 'answerQuestion':
     case 'flipTile':
     case 'resetFlips':
     case 'submitGuess':
+    case 'playOn':
+    case 'playAgain':
     case 'rematch':
-      return applyGame(state, actorId, message);
+      return applyGame(state, actorId, message, deps.pick);
 
     case 'setTeam': {
       const blocked = lobbyOnly();
@@ -249,22 +253,7 @@ export function apply(
       // the manifest and passes it down rather than making every transition async.
       if (!deps.characters) return reject('pack_unavailable', 'That pack could not be loaded');
 
-      return beginGame(state, deps.characters, deps.pick ?? randomIndex);
+      return beginGame(state, deps.characters, deps.pick);
     }
   }
-}
-
-/**
- * Rejection sampling rather than a plain modulo, so every character is equally likely to be
- * drawn. Cheap insurance against a board where one face quietly comes up more often than the rest.
- */
-function randomIndex(upperBound: number): number {
-  const ceiling = Math.floor(2 ** 32 / upperBound) * upperBound;
-  const buffer = new Uint32Array(1);
-  let value = 0;
-  do {
-    crypto.getRandomValues(buffer);
-    value = buffer[0] ?? 0;
-  } while (value >= ceiling);
-  return value % upperBound;
 }

@@ -424,8 +424,14 @@ interface RoomStateLike {
     flipped: Record<string, string[]>;
     yourSecret: string | null;
     reveal: Record<string, string> | null;
-    log: { id: number; askedBy: string; text: string; answer: string | null }[];
-    outcome: { winner: string; reason: string; guess: { characterId: string } } | null;
+    log: { id: number; kind: string; askedBy: string; text: string; answer: string | null }[];
+    guesses: { team: string; characterId: string; correct: boolean }[];
+    canPlayOn: boolean;
+    outcome: {
+      winner: string | null;
+      reason: string;
+      guesses: { team: string; characterId: string; correct: boolean }[];
+    } | null;
   } | null;
 }
 
@@ -460,14 +466,30 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
   for (const player of [alice, carol, bob, erin]) player.send({ type: 'setReady', ready: true });
   await alice.until((state) => state.startBlockers.length === 0);
 
-  alice.send({ type: 'startGame' });
-  for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
-  check('a spectator does not block the start', true);
+  // The two secrets are drawn independently, so both teams can be dealt the same character —
+  // legitimate in play, but it would quietly gut the leak checks below, because Red's secret
+  // appearing in Blue's frames would then be Blue's own. Re-deal until they differ so every
+  // assertion stays unconditional rather than skipped one run in twenty-four.
+  let redSecret: string | null | undefined;
+  let blueSecret: string | null | undefined;
 
-  const redSecret = alice.latest()?.game?.yourSecret;
-  const blueSecret = bob.latest()?.game?.yourSecret;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    alice.send({ type: 'startGame' });
+    for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
+    redSecret = alice.latest()?.game?.yourSecret;
+    blueSecret = bob.latest()?.game?.yourSecret;
+    if (redSecret !== blueSecret) break;
+
+    alice.send({ type: 'rematch' });
+    for (const client of everyone) await client.until((state) => state.phase === 'lobby');
+    for (const player of [alice, carol, bob, erin]) player.send({ type: 'setReady', ready: true });
+    await alice.until((state) => state.startBlockers.length === 0);
+  }
+
+  check('a spectator does not block the start', true);
   check('Red’s leader is told their character', typeof redSecret === 'string', redSecret);
   check('Blue’s leader is told their character', typeof blueSecret === 'string', blueSecret);
+  check('the teams hold different characters, so the leak checks mean something', redSecret !== blueSecret);
   check('the dealt characters are on the board', characterIds.includes(redSecret ?? ''), redSecret);
   checkEqual('a teammate is not told the secret', carol.latest()?.game?.yourSecret, null);
   checkEqual('a spectator is not told either secret', dave.latest()?.game?.yourSecret, null);
@@ -483,10 +505,24 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
   bob.send({ type: 'askQuestion', text: 'Can I ask out of turn?' });
   checkEqual('the waiting team cannot ask', (await bob.nextError())?.code, 'not_your_turn');
 
+  // Passing: most questions get asked out loud, so a leader can hand the turn over untyped.
+  alice.send({ type: 'passTurn' });
+  await bob.until((state) => state.game?.activeTeam === 'b');
+  checkEqual('passing is recorded in the log', alice.latest()?.game?.log[0]?.kind, 'pass');
+  checkEqual('passing hands the turn over without a question', alice.latest()?.game?.stage, 'asking');
+  bob.send({ type: 'passTurn' });
+  await alice.until((state) => state.game?.activeTeam === 'a');
+  check('the turn comes back after both pass', true);
+
   alice.send({ type: 'askQuestion', text: 'Do they wear glasses?' });
   await bob.until((state) => state.game?.stage === 'answering');
-  checkEqual('the question reaches the other team', bob.latest()?.game?.log[0]?.text, 'Do they wear glasses?');
-  checkEqual('the question log is public to spectators', dave.latest()?.game?.log.length, 1);
+  // Indexes shift as passes land in the log, so the assertions look the entry up by kind.
+  const lastQuestion = (client: RoomClientLike) =>
+    [...(client.latest()?.game?.log ?? [])].reverse().find((entry) => entry.kind === 'question');
+  const logLength = (client: RoomClientLike) => client.latest()?.game?.log.length ?? 0;
+
+  checkEqual('the question reaches the other team', lastQuestion(bob)?.text, 'Do they wear glasses?');
+  checkEqual('the whole log is public to spectators', logLength(dave), 3);
 
   alice.send({ type: 'answerQuestion', answer: 'yes' });
   checkEqual('you cannot answer your own question', (await alice.nextError())?.code, 'not_your_question');
@@ -497,7 +533,7 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
 
   bob.send({ type: 'answerQuestion', answer: 'no' });
   await alice.until((state) => state.game?.activeTeam === 'b');
-  checkEqual('the answer is logged', alice.latest()?.game?.log[0]?.answer, 'no');
+  checkEqual('the answer is logged', lastQuestion(alice)?.answer, 'no');
   checkEqual('answering passes the turn', alice.latest()?.game?.stage, 'asking');
 
   // Flips are shared within a team and invisible outside it. Pick faces that are nobody's
@@ -527,6 +563,8 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
 
   checkEqual('a wrong guess gives the game to the other team', alice.latest()?.game?.outcome?.winner, 'a');
   checkEqual('the outcome says why', alice.latest()?.game?.outcome?.reason, 'wrong_guess');
+  checkEqual('the guess is recorded for everyone to see', alice.latest()?.game?.outcome?.guesses.length, 1);
+  check('the team that never guessed can be sent back in', alice.latest()?.game?.canPlayOn === true);
   for (const client of everyone) {
     checkEqual(`${client.name} sees both characters revealed`, client.latest()?.game?.reveal, {
       a: redSecret,
@@ -553,6 +591,57 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
 
   alice.send({ type: 'askQuestion', text: 'One more?' });
   checkEqual('a finished game accepts no more moves', (await alice.nextError())?.code, 'game_over');
+
+  // Red never had its guess, so the host can send everyone back in for it.
+  bob.send({ type: 'playOn' });
+  checkEqual('only the host can reopen the game', (await bob.nextError())?.code, 'not_host');
+
+  alice.send({ type: 'playOn' });
+  for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
+  checkEqual('the finishing team is put on turn', alice.latest()?.game?.activeTeam, 'a');
+  checkEqual('the provisional result is cleared', alice.latest()?.game?.outcome, null);
+  checkEqual('the question log survives the reopen', logLength(alice), 3);
+  checkEqual('Red’s board survives the reopen', alice.latest()?.game?.flipped['a'], [redFlip]);
+  checkEqual('the leader still holds their character', alice.latest()?.game?.yourSecret, redSecret);
+
+  bob.send({ type: 'askQuestion', text: 'Can I keep playing?' });
+  checkEqual('a team that already guessed cannot ask', (await bob.nextError())?.code, 'not_your_turn');
+  bob.send({ type: 'submitGuess', characterId: blueSecret ?? '' });
+  checkEqual('a team that already guessed cannot guess again', (await bob.nextError())?.code, 'not_your_turn');
+
+  // Blue still answers, because Blue holds the character Red is hunting.
+  alice.send({ type: 'askQuestion', text: 'Do they have a hat?' });
+  await bob.until((state) => state.game?.stage === 'answering');
+  bob.send({ type: 'answerQuestion', answer: 'yes' });
+  await alice.until((state) => state.game?.stage === 'asking');
+  checkEqual('the turn does not pass back to the finished team', alice.latest()?.game?.activeTeam, 'a');
+
+  alice.send({ type: 'submitGuess', characterId: blueSecret ?? '' });
+  for (const client of everyone) await client.until((state) => state.phase === 'endgame');
+  checkEqual('finishing correctly takes the win', alice.latest()?.game?.outcome?.winner, 'a');
+  checkEqual('both guesses are on the record', alice.latest()?.game?.outcome?.guesses.length, 2);
+  checkEqual('the game cannot be reopened twice', alice.latest()?.game?.canPlayOn, false);
+
+  alice.send({ type: 'playOn' });
+  checkEqual('reopening is refused once both teams have guessed', (await alice.nextError())?.code, 'nothing_to_finish');
+
+  // Straight into another game: same teams, same board, nobody has to ready up again.
+  bob.send({ type: 'playAgain' });
+  checkEqual('only the host can start another game', (await bob.nextError())?.code, 'not_host');
+
+  alice.send({ type: 'playAgain' });
+  for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
+  checkEqual('play again deals a fresh game', alice.latest()?.game?.log.length, 0);
+  checkEqual('play again clears the guesses', alice.latest()?.game?.guesses.length, 0);
+  checkEqual('play again clears the boards', alice.latest()?.game?.flipped['a'], []);
+  // The board itself is never sent to clients, so the pack is what there is to check.
+  checkEqual('play again keeps the same pack', alice.latest()?.packId, packId);
+  checkEqual('play again keeps the leaders', alice.latest()?.leaders.a, 'dev-alice');
+  check('play again deals a character again', typeof alice.latest()?.game?.yourSecret === 'string');
+
+  // Finish the second game so the rematch path can be exercised from a real endgame.
+  alice.send({ type: 'submitGuess', characterId: alice.latest()?.game?.yourSecret ?? '' });
+  await alice.until((state) => state.phase === 'endgame');
 
   bob.send({ type: 'rematch' });
   checkEqual('only the host can call a rematch', (await bob.nextError())?.code, 'not_host');
@@ -660,6 +749,48 @@ async function runLobbyFlow(
   // The board only exists once the game is running.
   await evalOn<boolean>(alice, `await wait(() => document.querySelectorAll('.tile').length > 0); return true;`);
   return report;
+}
+
+/**
+ * A game that loses a whole team.
+ *
+ * Its own room, because it ends with players gone and would poison any assertion made after it.
+ * Without this the room would sit in `in_progress` forever, waiting for a turn nobody connected
+ * can take.
+ */
+async function checkAbandonedGame(packId: string): Promise<void> {
+  const instance = `e2e-abandon-${Date.now()}`;
+  const alice = await connectClient(instance, 'alice'); // host, Red
+  const bob = await connectClient(instance, 'bob'); // Blue, on their own
+
+  await alice.until((state) => state.members.length === 2);
+  alice.send({ type: 'setTeam', team: 'a' });
+  bob.send({ type: 'setTeam', team: 'b' });
+  alice.send({ type: 'selectPack', packId });
+  alice.send({ type: 'setReady', ready: true });
+  bob.send({ type: 'setReady', ready: true });
+  await alice.until((state) => state.startBlockers.length === 0);
+
+  alice.send({ type: 'startGame' });
+  await alice.until((state) => state.phase === 'in_progress');
+
+  bob.close();
+  await alice.until((state) => state.phase === 'endgame');
+  checkEqual('losing a whole team ends the game', alice.latest()?.game?.outcome?.reason, 'abandoned');
+  checkEqual('the team still standing takes it', alice.latest()?.game?.outcome?.winner, 'a');
+  checkEqual('there is nobody to hand a turn back to', alice.latest()?.game?.canPlayOn, false);
+
+  alice.send({ type: 'playOn' });
+  checkEqual('an abandoned game has no turn to finish', (await alice.nextError())?.code, 'nothing_to_finish');
+  alice.send({ type: 'playAgain' });
+  checkEqual('another game is refused with a team missing', (await alice.nextError())?.code, 'team_empty');
+
+  // The room is still usable: back to the lobby and the survivors can regroup.
+  alice.send({ type: 'rematch' });
+  await alice.until((state) => state.phase === 'lobby');
+  check('the room survives a walkout', alice.latest()?.game === null);
+
+  alice.close();
 }
 
 /**
@@ -778,9 +909,10 @@ async function checkCustomPack(): Promise<void> {
 
 interface GameUiReport {
   aliceSeesSecret: boolean;
-  bobSeesDifferentSecret: boolean;
+  bobSeesSecret: boolean;
   aliceSecretIsHers: boolean;
   bobWaitsForRed: boolean;
+  passHandsOver: boolean;
   bobGetsTheQuestion: boolean;
   aliceSeesAnswer: string;
   turnPassedToBlue: boolean;
@@ -789,6 +921,12 @@ interface GameUiReport {
   aliceSeesResult: string;
   bobSeesResult: string;
   bothRevealed: boolean;
+  playOnOffered: boolean;
+  redGetsTheTurnBack: boolean;
+  blueIsAnsweringOnly: boolean;
+  finalResult: string;
+  playOnGoneAfterBoth: boolean;
+  playAgainRestarts: boolean;
   rematchReturnsToLobby: boolean;
 }
 
@@ -813,7 +951,9 @@ async function runGameFlow(
   const aliceSecret = await evalOn<string>(alice, `await wait(() => secretName()); return secretName();`);
   const bobSecret = await evalOn<string>(bob, `await wait(() => secretName()); return secretName();`);
   report.aliceSeesSecret = Boolean(aliceSecret);
-  report.bobSeesDifferentSecret = Boolean(bobSecret) && bobSecret !== aliceSecret;
+  // Not "and a different one": the deal is independent per team, so both leaders holding the
+  // same character is a legal hand rather than a bug.
+  report.bobSeesSecret = Boolean(bobSecret);
   // The badge on the board must agree with the card, or a leader is hunting the wrong face.
   report.aliceSecretIsHers = await evalOn<boolean>(
     alice,
@@ -822,6 +962,16 @@ async function runGameFlow(
   );
 
   report.bobWaitsForRed = await evalOn<boolean>(bob, `return !document.querySelector('.ask input');`);
+
+  // Passing: the question was asked out loud, so the turn goes over untyped and comes back.
+  await evalOn<boolean>(alice, `byText('.actions button', 'Pass').click(); return true;`);
+  report.passHandsOver = await evalOn<boolean>(
+    bob,
+    `await wait(() => document.querySelector('.ask input'));
+     return /passed/.test(document.body.textContent);`,
+  );
+  await evalOn<boolean>(bob, `byText('.actions button', 'Pass').click(); return true;`);
+  await evalOn<boolean>(alice, `await wait(() => document.querySelector('.ask input')); return true;`);
 
   await evalOn<boolean>(
     alice,
@@ -881,13 +1031,102 @@ async function runGameFlow(
      return true;`,
   );
 
-  await evalOn<boolean>(alice, `byText('button', 'Back to the lobby').click(); return true;`);
+  // Blue guessed, so Red never had its attempt. The host can send everyone back in for it.
+  report.playOnOffered = await evalOn<boolean>(alice, `return !!byText('.play-on button', 'Let Red finish');`);
+  await evalOn<boolean>(alice, `byText('.play-on button', 'Let Red finish').click(); return true;`);
+
+  report.redGetsTheTurnBack = await evalOn<boolean>(
+    alice,
+    `await wait(() => document.querySelector('.ask input')); return !document.querySelector('.result');`,
+  );
+  // Blue is out of the running but still holds the character Red is hunting, so it answers.
+  report.blueIsAnsweringOnly = await evalOn<boolean>(
+    bob,
+    `await wait(() => /answering only/.test(document.body.textContent));
+     return !document.querySelector('.ask input');`,
+  );
+
+  await evalOn<boolean>(
+    alice,
+    `byText('.actions button', 'Guess their character').click();
+     await wait(() => document.querySelector('.board.is-guessing'));
+     document.querySelectorAll('.tile')[7].click();
+     await wait(() => document.querySelector('.confirm'));
+     byText('.confirm button', "Yes, that's them").click();
+     return true;`,
+  );
+
+  report.finalResult = await evalOn<string>(
+    bob,
+    `const el = await wait(() => document.querySelector('.result h2')); return el.textContent.trim();`,
+  );
+  report.playOnGoneAfterBoth = await evalOn<boolean>(
+    alice,
+    `await wait(() => document.querySelector('.result'));
+     return document.querySelectorAll('.guess').length === 2 && !document.querySelector('.play-on');`,
+  );
+
+  // Play again skips the lobby entirely: same teams, fresh characters.
+  await evalOn<boolean>(alice, `byText('button', 'Play again').click(); return true;`);
+  report.playAgainRestarts = await evalOn<boolean>(
+    bob,
+    `await wait(() => !document.querySelector('.result') && document.querySelectorAll('.tile').length > 0);
+     return !document.querySelector('.teams') && document.querySelectorAll('.log-entry').length === 0;`,
+  );
+
+  // End this one too, so the room is back in the lobby for the sections that follow.
+  await evalOn<boolean>(
+    alice,
+    `byText('.actions button', 'Guess their character').click();
+     await wait(() => document.querySelector('.board.is-guessing'));
+     document.querySelectorAll('.tile')[1].click();
+     await wait(() => document.querySelector('.confirm'));
+     byText('.confirm button', "Yes, that's them").click();
+     await wait(() => byText('button', 'Back to the lobby')).then(b => b.click());
+     return true;`,
+  );
   report.rematchReturnsToLobby = await evalOn<boolean>(
     bob,
     `await wait(() => document.querySelector('.teams')); return true;`,
   );
 
   return report;
+}
+
+interface LeaveReport {
+  exitScreen: boolean;
+  gameEndedForTheOthers: boolean;
+}
+
+/**
+ * The header's Leave button, and what it does to a game in progress.
+ *
+ * Runs last because it takes a player out for good. Outside Discord there is no frame to close,
+ * so the app has to show its own exit screen rather than assuming it has gone; inside Discord
+ * the same click closes the activity.
+ */
+async function runLeaveFlow(
+  leaver: Awaited<ReturnType<typeof openPage>>,
+  staying: Awaited<ReturnType<typeof openPage>>,
+): Promise<LeaveReport> {
+  const evalOn = <T,>(target: typeof leaver, body: string) =>
+    target.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  const exitScreen = await evalOn<boolean>(
+    leaver,
+    `byText('header button', 'Leave').click();
+     await wait(() => /You left the game/.test(document.body.textContent));
+     return !!byText('button', 'Rejoin');`,
+  );
+
+  // The leaver was the last player on their side, so the game cannot go on.
+  const gameEndedForTheOthers = await evalOn<boolean>(
+    staying,
+    `const result = await wait(() => document.querySelector('.result h2'), 15000);
+     return /wins|draw/i.test(result.textContent);`,
+  );
+
+  return { exitScreen, gameEndedForTheOthers };
 }
 
 /**
@@ -961,11 +1200,7 @@ async function runCustomPackUpload(
 
   await page.call('DOM.setFileInputFiles', { nodeId: input.nodeId, files });
 
-  // Encoding forty photos would be slow; ten is quick, but still give it room on a cold CI box.
-  await evalOn<boolean>(
-    `await wait(() => document.querySelector('.chip.is-active')?.textContent?.includes('${files.length}'), 60000);
-     return true;`,
-  );
+  await evalOn<boolean>(`${AWAIT_UPLOAD} return true;`);
 
   // Publishing a new board clears everyone's readiness, so both players confirm again.
   await other.evaluate<boolean>(
@@ -998,6 +1233,103 @@ async function runCustomPackUpload(
      return report;`,
   );
 }
+
+interface JpegFallbackReport {
+  detectedExtension: string;
+  contentType: string | null;
+  tileCount: number;
+  brokenImages: number;
+  largestPhotoBytes: number;
+}
+
+/**
+ * Repeats the upload in a browser that cannot encode WebP.
+ *
+ * `canvas.toBlob` is patched to answer a WebP request with PNG, which is exactly what a browser
+ * without WebP output does — silently, ignoring `quality` too. That is the failure a real user
+ * hit, and it is invisible to a Chrome-only test, so it is simulated rather than hoped about.
+ * The board must still arrive, as JPEG, and be served as JPEG.
+ */
+async function runJpegFallbackUpload(
+  page: Awaited<ReturnType<typeof openPage>>,
+  other: Awaited<ReturnType<typeof openPage>>,
+  files: string[],
+): Promise<JpegFallbackReport> {
+  const evalOn = <T,>(target: typeof page, body: string) =>
+    target.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  // End the game that the previous upload started, so the lobby is reachable again.
+  await evalOn<boolean>(
+    page,
+    `byText('.actions button', 'Guess their character').click();
+     await wait(() => document.querySelector('.board.is-guessing'));
+     document.querySelectorAll('.tile')[2].click();
+     await wait(() => document.querySelector('.confirm'));
+     byText('.confirm button', "Yes, that's them").click();
+     await wait(() => document.querySelector('.result'));
+     await wait(() => byText('button', 'Back to the lobby')).then(b => b.click());
+     await wait(() => document.querySelector('.teams'));
+     return true;`,
+  );
+
+  await evalOn<boolean>(
+    page,
+    `const original = HTMLCanvasElement.prototype.toBlob;
+     HTMLCanvasElement.prototype.toBlob = function (callback, type, quality) {
+       return original.call(this, callback, type === 'image/webp' ? 'image/png' : type, quality);
+     };
+     return true;`,
+  );
+
+  const document_ = (await page.call('DOM.getDocument', { depth: 0 })).result as { root: { nodeId: number } };
+  const input = (await page.call('DOM.querySelector', {
+    nodeId: document_.root.nodeId,
+    selector: 'input[type="file"]',
+  })).result as { nodeId: number };
+  await page.call('DOM.setFileInputFiles', { nodeId: input.nodeId, files });
+
+  await evalOn<boolean>(page, `${AWAIT_UPLOAD} return true;`);
+
+  await evalOn<boolean>(other, `await wait(() => byText('button', "I'm ready")).then(b => b.click()); return true;`);
+
+  return evalOn<JpegFallbackReport>(
+    page,
+    `byText('button', "I'm ready").click();
+     await wait(() => !byText('button', 'Start game').disabled);
+     byText('button', 'Start game').click();
+     await wait(() => document.querySelectorAll('.tile').length > 0, 20000);
+
+     const images = [...document.querySelectorAll('.tile img')];
+     for (const img of images) img.loading = 'eager';
+     await wait(() => images.every(i => i.complete), 20000);
+
+     const first = new URL(images[0].src);
+     const response = await fetch(first);
+     const sizes = await Promise.all(
+       [...new Set(images.map(i => i.src))].map(async url => (await (await fetch(url)).blob()).size),
+     );
+
+     return {
+       detectedExtension: first.pathname.split('.').pop(),
+       contentType: response.headers.get('content-type'),
+       tileCount: images.length,
+       brokenImages: images.filter(i => i.naturalWidth === 0).length,
+       largestPhotoBytes: Math.max(...sizes),
+     };`,
+  );
+}
+
+/**
+ * Waits for an upload to start and then finish.
+ *
+ * Keyed on the progress bar rather than on the pack chip: a second upload replaces a board that
+ * already has the same photo count, so "a chip says 10" is true before the new one has begun and
+ * would silently measure the previous board.
+ */
+const AWAIT_UPLOAD = `
+  await wait(() => document.querySelector('.upload-progress'), 15000);
+  await wait(() => !document.querySelector('.upload-progress'), 120000);
+`;
 
 const GAME_HELPERS = `
   const secretName = () => {
@@ -1138,6 +1470,9 @@ async function main(): Promise<void> {
     if (firstPack) {
       console.log('\nGame (over the wire)');
       await checkGameProtocol(firstPack.id, characterIds);
+
+      console.log('\nA team walking out');
+      await checkAbandonedGame(firstPack.id);
     }
 
     console.log('\nCustom photo pack');
@@ -1220,7 +1555,7 @@ async function main(): Promise<void> {
     const played = await runGameFlow(alice, bob);
 
     check('the leader is shown a character', played.aliceSeesSecret);
-    check('each leader gets their own character', played.bobSeesDifferentSecret);
+    check('the opposing leader is shown one too', played.bobSeesSecret);
     check('the marked tile matches the secret card', played.aliceSecretIsHers);
     check('the waiting leader has nothing to submit', played.bobWaitsForRed);
     check('the question reaches the other leader', played.bobGetsTheQuestion);
@@ -1235,14 +1570,19 @@ async function main(): Promise<void> {
       played,
     );
     check('both characters are revealed on the board', played.bothRevealed);
+    check('the team that never guessed is offered its turn', played.playOnOffered);
+    check('reopening puts them back on the board', played.redGetsTheTurnBack);
+    check('the team that already guessed is told it can only answer', played.blueIsAnsweringOnly);
+    check('finishing decides it for good', played.finalResult.length > 0, played.finalResult);
+    check('both guesses are shown and the offer is gone', played.playOnGoneAfterBoth);
+    check('passing hands the turn over without a question', played.passHandsOver);
+    check('play again starts a fresh game without the lobby', played.playAgainRestarts);
     check('a rematch puts everyone back in the lobby', played.rematchReturnsToLobby);
 
     console.log('\nCustom photos (picked in the browser)');
     const photoNames = ['Ada', 'Bram', 'Cleo', 'Dev', 'Elif', 'Fionn', 'Greta', 'Hugo', 'Ines', 'Jonas'];
     const photos = await writeTestPhotos(photosDir, photoNames);
     const uploaded = await runCustomPackUpload(alice, bob, photos);
-    alice.close();
-    bob.close();
 
     checkEqual('the uploaded board has one tile per photo', uploaded.tileNames.length, photoNames.length);
     checkEqual('filenames become the names on the board', uploaded.tileNames, photoNames);
@@ -1254,6 +1594,26 @@ async function main(): Promise<void> {
       `photos fit the room’s cap (largest ${Math.round(uploaded.largestPhotoBytes / 1024)} KB of 128 KB)`,
       uploaded.largestPhotoBytes > 0 && uploaded.largestPhotoBytes <= 128 * 1024,
     );
+
+    console.log('\nCustom photos (browser without WebP encoding)');
+    const fallback = await runJpegFallbackUpload(alice, bob, photos);
+
+    checkEqual('the board falls back to JPEG', fallback.detectedExtension, 'jpg');
+    checkEqual('and is served as JPEG, not mislabelled', fallback.contentType, 'image/jpeg');
+    checkEqual('the whole board still uploads', fallback.tileCount, photoNames.length);
+    checkEqual('every fallback photo renders', fallback.brokenImages, 0);
+    check(
+      `fallback photos fit the cap (largest ${Math.round(fallback.largestPhotoBytes / 1024)} KB of 128 KB)`,
+      fallback.largestPhotoBytes > 0 && fallback.largestPhotoBytes <= 128 * 1024,
+    );
+
+    console.log('\nLeaving');
+    const departure = await runLeaveFlow(bob, alice);
+    alice.close();
+    bob.close();
+
+    check('leaving shows the exit screen', departure.exitScreen);
+    check('the last player leaving a team ends the game', departure.gameEndedForTheOthers);
   } finally {
     if (!(keepOpen && failures > 0)) await cleanup();
     else console.log(`\nLeaving the server up at ${BASE_URL} (--keep-open).`);

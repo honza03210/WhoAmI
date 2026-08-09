@@ -12,8 +12,8 @@
  *   - Only the leader may ask, answer or guess. Everyone else flips tiles and argues.
  */
 
-import type { ClientMessage, GameState, RoomState, TeamId } from './protocol';
-import { otherTeam } from './protocol';
+import type { ClientMessage, GameGuess, GameOutcome, GameState, RoomState, TeamId } from './protocol';
+import { TEAM_IDS, TEAM_NAMES, otherTeam } from './protocol';
 
 export interface Rejection {
   code: string;
@@ -37,7 +37,7 @@ export type Pick = (upperBound: number) => number;
  * The two secrets are drawn independently, so both teams hunting the same character is possible
  * and fine — it is the one case where the question logs read identically, which nobody notices.
  */
-export function beginGame(state: RoomState, characters: readonly string[], pick: Pick): Outcome {
+export function beginGame(state: RoomState, characters: readonly string[], pick: Pick = randomIndex): Outcome {
   if (characters.length < 2) {
     return reject('pack_too_small', 'That pack needs at least two characters');
   }
@@ -57,6 +57,7 @@ export function beginGame(state: RoomState, characters: readonly string[], pick:
     stage: 'asking',
     log: [],
     nextQuestionId: 1,
+    guesses: [],
     outcome: null,
   };
 
@@ -75,8 +76,15 @@ function actorIn(state: RoomState, userId: string): Actor | null {
   return { team: member.team, isLeader: state.leaders[member.team] === userId };
 }
 
-export function applyGame(state: RoomState, actorId: string, message: ClientMessage): Outcome {
+export function applyGame(
+  state: RoomState,
+  actorId: string,
+  message: ClientMessage,
+  pick: Pick = randomIndex,
+): Outcome {
   if (message.type === 'rematch') return rematch(state, actorId);
+  if (message.type === 'playOn') return playOn(state, actorId);
+  if (message.type === 'playAgain') return playAgain(state, actorId, pick);
 
   const game = state.game;
   if (!game) return reject('not_in_game', 'No game is running');
@@ -92,12 +100,32 @@ export function applyGame(state: RoomState, actorId: string, message: ClientMess
       if (!actor.isLeader) return reject('not_leader', 'Only your team leader can ask');
       if (actor.team !== game.activeTeam) return reject('not_your_turn', "It is the other team's turn");
       if (game.stage !== 'asking') return reject('awaiting_answer', 'Wait for your question to be answered');
+      if (hasGuessed(game, actor.team)) return reject('already_guessed', 'Your team has already guessed');
 
       const log = [
         ...game.log,
-        { id: game.nextQuestionId, askedBy: actor.team, text: message.text, answer: null },
+        { id: game.nextQuestionId, kind: 'question' as const, askedBy: actor.team, text: message.text, answer: null },
       ];
       return accept(withGame(state, { ...game, log, nextQuestionId: game.nextQuestionId + 1, stage: 'answering' }));
+    }
+
+    case 'passTurn': {
+      if (!actor.isLeader) return reject('not_leader', 'Only your team leader can pass');
+      if (actor.team !== game.activeTeam) return reject('not_your_turn', "It is the other team's turn");
+      if (game.stage !== 'asking') return reject('awaiting_answer', 'Wait for your question to be answered');
+
+      // With the other team out of the running there is nobody to hand the turn to, and passing
+      // would just stall the game.
+      const next = otherTeam(actor.team);
+      if (hasGuessed(game, next)) return reject('nobody_to_pass_to', 'The other team has already guessed');
+
+      const log = [
+        ...game.log,
+        { id: game.nextQuestionId, kind: 'pass' as const, askedBy: actor.team, text: '', answer: null },
+      ];
+      return accept(
+        withGame(state, { ...game, log, nextQuestionId: game.nextQuestionId + 1, activeTeam: next }),
+      );
     }
 
     case 'answerQuestion': {
@@ -110,8 +138,11 @@ export function applyGame(state: RoomState, actorId: string, message: ClientMess
       const log = game.log.map((entry, index) =>
         index === game.log.length - 1 ? { ...entry, answer: message.answer } : entry,
       );
-      // Answering ends the turn: play passes to the team that just answered.
-      return accept(withGame(state, { ...game, log, stage: 'asking', activeTeam: answering }));
+      // Answering ends the turn: play passes to the team that just answered — unless they have
+      // already had their guess, in which case they are only here to answer and the asker
+      // continues alone.
+      const next = hasGuessed(game, answering) ? game.activeTeam : answering;
+      return accept(withGame(state, { ...game, log, stage: 'asking', activeTeam: next }));
     }
 
     case 'flipTile': {
@@ -142,31 +173,136 @@ export function applyGame(state: RoomState, actorId: string, message: ClientMess
       if (actor.team !== game.activeTeam) return reject('not_your_turn', "It is the other team's turn");
       // A guess replaces this turn's question, so it can only happen before one is outstanding.
       if (game.stage !== 'asking') return reject('awaiting_answer', 'Answer the open question first');
+      if (hasGuessed(game, actor.team)) return reject('already_guessed', 'Your team has already guessed');
       if (!game.characters.includes(message.characterId)) {
         return reject('no_such_character', 'That character is not on this board');
       }
 
       const target = otherTeam(actor.team);
-      const correct = game.secrets[target] === message.characterId;
+      const guesses = [
+        ...game.guesses,
+        { team: actor.team, characterId: message.characterId, correct: game.secrets[target] === message.characterId },
+      ];
 
-      return accept({
-        ...state,
-        phase: 'endgame',
-        game: {
-          ...game,
-          // A wrong guess hands the game over: the bluff costs you, exactly as at the table.
-          outcome: {
-            winner: correct ? actor.team : target,
-            reason: correct ? 'correct_guess' : 'wrong_guess',
-            guess: { team: actor.team, characterId: message.characterId, correct },
-          },
-        },
-      });
+      // Naming a character always stops play — the board is decided and the reveal is the payoff.
+      // Whether that is final depends on whether the other team still wants their attempt.
+      return accept({ ...state, phase: 'endgame', game: { ...game, guesses, outcome: resolve(guesses) } });
     }
 
     default:
       return reject('not_in_game', 'That does not apply once the game has started');
   }
+}
+
+export function hasGuessed(game: GameState, team: TeamId): boolean {
+  return game.guesses.some((guess) => guess.team === team);
+}
+
+/**
+ * The team owed a turn, which only means anything once exactly one team has guessed.
+ *
+ * With no guesses at all there is nothing to finish — that is a game that ended some other way,
+ * such as a team walking out — and with two the game is done.
+ */
+export function teamStillToGuess(game: GameState): TeamId | null {
+  if (game.guesses.length !== 1) return null;
+  return TEAM_IDS.find((team) => !hasGuessed(game, team)) ?? null;
+}
+
+/**
+ * Who won, from the guesses made so far.
+ *
+ * Naming the character wins, and naming it first wins outright — a second correct guess is a
+ * team proving they had it too, not a tie. One wrong guess with no reply hands the game over,
+ * which is the classic penalty. Two wrong guesses is a draw: nobody found them.
+ */
+function resolve(guesses: GameGuess[]): GameOutcome {
+  const correct = guesses.find((guess) => guess.correct);
+  if (correct) return { winner: correct.team, reason: 'correct_guess', guesses };
+
+  const only = guesses.length === 1 ? guesses[0] : undefined;
+  if (only) return { winner: otherTeam(only.team), reason: 'wrong_guess', guesses };
+
+  return { winner: null, reason: 'draw', guesses };
+}
+
+/**
+ * Sends everyone back in so the team that has not guessed can finish.
+ *
+ * A guess stops the game dead, which is unfair on a team mid-deduction — they may not even have
+ * had the same number of turns. This reopens the board for them alone: they ask, the team that
+ * already guessed still answers, and their own guess ends it for good.
+ */
+function playOn(state: RoomState, actorId: string): Outcome {
+  if (state.phase !== 'endgame' || !state.game) return reject('not_finished', 'The game is still going');
+  if (state.hostId !== actorId) return reject('not_host', 'Only the host can reopen the game');
+
+  const remaining = teamStillToGuess(state.game);
+  if (!remaining) return reject('nothing_to_finish', 'There is no turn left to hand back');
+
+  return accept({
+    ...state,
+    phase: 'in_progress',
+    game: { ...state.game, activeTeam: remaining, stage: 'asking', outcome: null },
+  });
+}
+
+/** Connected players on a team. A team with none of these cannot take a turn. */
+function manning(state: RoomState, team: TeamId): boolean {
+  return state.members.some((member) => member.team === team && member.connected);
+}
+
+/**
+ * Straight into another game with the same teams, leaders and board.
+ *
+ * Everyone has already agreed to this line-up by playing a game with it, so this skips the lobby
+ * and the ready-up entirely. The board is reused from the finished game, which is also why this
+ * needs no pack lookup.
+ */
+function playAgain(state: RoomState, actorId: string, pick: Pick): Outcome {
+  if (state.phase !== 'endgame' || !state.game) return reject('not_finished', 'The game is still going');
+  if (state.hostId !== actorId) return reject('not_host', 'Only the host can start another game');
+
+  const short = TEAM_IDS.find((team) => !manning(state, team));
+  if (short) return reject('team_empty', `${TEAM_NAMES[short]} has nobody left to play`);
+
+  return beginGame(state, state.game.characters, pick);
+}
+
+/**
+ * Ends a game that has lost a whole team.
+ *
+ * Called after every departure. One team walking out is a walkover for the other; both going is
+ * nobody's win. Without this the room would sit in `in_progress` forever waiting for a turn that
+ * no connected player can take.
+ */
+export function endIfTeamAbandoned(state: RoomState): RoomState {
+  if (state.phase !== 'in_progress' || !state.game) return state;
+
+  const empty = TEAM_IDS.filter((team) => !manning(state, team));
+  if (empty.length === 0) return state;
+
+  const survivor = TEAM_IDS.find((team) => !empty.includes(team)) ?? null;
+  return {
+    ...state,
+    phase: 'endgame',
+    game: { ...state.game, outcome: { winner: survivor, reason: 'abandoned', guesses: state.game.guesses } },
+  };
+}
+
+/**
+ * Rejection sampling rather than a plain modulo, so every character is equally likely to be
+ * drawn. Cheap insurance against a board where one face quietly comes up more often than the rest.
+ */
+export function randomIndex(upperBound: number): number {
+  const ceiling = Math.floor(2 ** 32 / upperBound) * upperBound;
+  const buffer = new Uint32Array(1);
+  let value = 0;
+  do {
+    crypto.getRandomValues(buffer);
+    value = buffer[0] ?? 0;
+  } while (value >= ceiling);
+  return value % upperBound;
 }
 
 /**

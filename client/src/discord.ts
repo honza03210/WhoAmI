@@ -1,4 +1,4 @@
-import { DiscordSDK, DiscordSDKMock } from '@discord/embedded-app-sdk';
+import { DiscordSDK, DiscordSDKMock, RPCCloseCodes } from '@discord/embedded-app-sdk';
 import { avatarUrl } from './avatar';
 import type { EventPayloadData, IDiscordSDK } from '@discord/embedded-app-sdk';
 
@@ -165,6 +165,21 @@ async function connectStandalone(): Promise<Connection> {
       avatarUrl: avatarUrl('100000000000000001', null),
     },
   };
+}
+
+/**
+ * Closes the activity from inside it.
+ *
+ * Discord tears the iframe down, which drops the room socket and takes the player out of the
+ * game. Outside Discord the mock accepts the call and nothing visible happens, so the caller
+ * shows its own "you left" screen either way rather than depending on the frame going away.
+ */
+export function leaveActivity(sdk: IDiscordSDK): void {
+  try {
+    sdk.close(RPCCloseCodes.CLOSE_NORMAL, 'Left the game');
+  } catch {
+    // Standalone, or a Discord client that refused; the caller has already left the room.
+  }
 }
 
 export async function getParticipants(sdk: IDiscordSDK): Promise<AppUser[]> {

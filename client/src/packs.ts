@@ -1,5 +1,5 @@
 import type { CustomPack } from '../../server/protocol';
-import { CUSTOM_PACK_ID } from '../../server/protocol';
+import { CUSTOM_PACK_ID, PACK_IMAGE_EXTENSION } from '../../server/protocol';
 import { apiPath } from './discord';
 
 export interface PackCharacter {
@@ -42,6 +42,9 @@ export function packAsset(pack: PackManifest, file: string): string {
  * state frame, so there is nothing left to ask the server for.
  */
 export function manifestFromCustomPack(pack: CustomPack, instanceId: string): PackManifest {
+  // A pack committed before the format was recorded holds WebP.
+  const extension = PACK_IMAGE_EXTENSION[pack.format] ?? PACK_IMAGE_EXTENSION.webp;
+
   return {
     id: CUSTOM_PACK_ID,
     name: pack.name,
@@ -49,8 +52,8 @@ export function manifestFromCustomPack(pack: CustomPack, instanceId: string): Pa
     characters: pack.characters.map((character) => ({
       id: character.id,
       name: character.name,
-      tile: `${character.id}.webp`,
-      full: `${character.id}@full.webp`,
+      tile: `${character.id}.${extension}`,
+      full: `${character.id}@full.${extension}`,
     })),
     // Photos are addressed by room and by the pack's random token; see handlePack in index.ts.
     baseUrl: apiPath(`/api/pack/${encodeURIComponent(instanceId)}/${pack.token}`),

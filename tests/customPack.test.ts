@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   checkPhoto,
   commitDraft,
+  contentTypeFor,
   draftHasExpired,
   fullFile,
   isValidFile,
@@ -11,16 +12,22 @@ import {
   tileFile,
   type PackDraft,
 } from '../server/customPack';
-import { CUSTOM_PACK_MAX, CUSTOM_PACK_MIN, CUSTOM_PHOTO_MAX_BYTES } from '../server/protocol';
+import {
+  CUSTOM_PACK_MAX,
+  CUSTOM_PACK_MIN,
+  CUSTOM_PHOTO_MAX_BYTES,
+  isPackImageFormat,
+  type PackImageFormat,
+} from '../server/protocol';
 
 const characters = (count: number) =>
   Array.from({ length: count }, (_, index) => ({ id: `p${index}`, name: `Person ${index}` }));
 
 /** A draft with every photo for `count` characters already stored. */
-function draftWith(count: number, ownerId = 'host'): PackDraft {
+function draftWith(count: number, ownerId = 'host', format: PackImageFormat = 'webp'): PackDraft {
   const draft = newDraft(ownerId, 'Party');
   for (const character of characters(count)) {
-    draft.stored.push(tileFile(character.id), fullFile(character.id));
+    draft.stored.push(tileFile(character.id, format), fullFile(character.id, format));
   }
   return draft;
 }
@@ -48,17 +55,32 @@ describe('upload tokens', () => {
 });
 
 describe('file names', () => {
-  it('accepts the two shapes the encoder produces', () => {
-    expect(isValidFile('ada.webp')).toBe(true);
-    expect(isValidFile('ada@full.webp')).toBe(true);
+  it('accepts the shapes the encoder produces, in either format', () => {
+    for (const good of ['ada.webp', 'ada@full.webp', 'ada.jpg', 'ada@full.jpg']) {
+      expect(isValidFile(good)).toBe(true);
+    }
     expect(isValidFile(tileFile('anne-marie'))).toBe(true);
     expect(isValidFile(fullFile('sam-2'))).toBe(true);
+    expect(isValidFile(tileFile('ada', 'jpeg'))).toBe(true);
+    expect(isValidFile(fullFile('ada', 'jpeg'))).toBe(true);
   });
 
-  it('rejects traversal and anything that is not a webp', () => {
+  it('rejects traversal and formats the encoder never produces', () => {
     for (const bad of ['../room', 'ada.png', 'ada.webp.exe', 'a/b.webp', 'Ada.webp', '.webp', '@full.webp']) {
       expect(isValidFile(bad)).toBe(false);
     }
+  });
+
+  it('names files by format, defaulting to webp', () => {
+    expect(tileFile('ada')).toBe('ada.webp');
+    expect(fullFile('ada')).toBe('ada@full.webp');
+    expect(tileFile('ada', 'jpeg')).toBe('ada.jpg');
+    expect(fullFile('ada', 'jpeg')).toBe('ada@full.jpg');
+  });
+
+  it('serves each format as itself, so a JPEG pack is not labelled WebP', () => {
+    expect(contentTypeFor('ada.webp')).toBe('image/webp');
+    expect(contentTypeFor('ada@full.jpg')).toBe('image/jpeg');
   });
 });
 
@@ -165,6 +187,31 @@ describe('committing a board', () => {
     }
     const outcome = commitDraft(draft, 'host', characters(CUSTOM_PACK_MIN));
     expect(outcome.ok && outcome.value.name).toBe('Custom');
+  });
+});
+
+describe('image formats', () => {
+  it('records the format the uploader could actually encode', () => {
+    const outcome = commitDraft(draftWith(CUSTOM_PACK_MIN, 'host', 'jpeg'), 'host', characters(CUSTOM_PACK_MIN), 'jpeg');
+    expect(outcome.ok).toBe(true);
+    expect(outcome.ok && outcome.value.format).toBe('jpeg');
+  });
+
+  it('defaults to webp, so a pack committed without one still works', () => {
+    const outcome = commitDraft(draftWith(CUSTOM_PACK_MIN), 'host', characters(CUSTOM_PACK_MIN));
+    expect(outcome.ok && outcome.value.format).toBe('webp');
+  });
+
+  it('refuses a board whose photos are not in the declared format', () => {
+    // Uploaded as WebP, committed as JPEG: the .jpg files were never stored.
+    const outcome = commitDraft(draftWith(CUSTOM_PACK_MIN), 'host', characters(CUSTOM_PACK_MIN), 'jpeg');
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok || outcome.error).toBe('missing_photo');
+  });
+
+  it('only accepts formats the client is allowed to declare', () => {
+    for (const good of ['webp', 'jpeg']) expect(isPackImageFormat(good)).toBe(true);
+    for (const bad of ['png', 'gif', '', null, undefined, 1]) expect(isPackImageFormat(bad)).toBe(false);
   });
 });
 
