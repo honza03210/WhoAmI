@@ -9,7 +9,8 @@ import type { RoomState, TeamId } from '../server/protocol';
  */
 const BOARD = ['ada', 'bob', 'cy', 'dee', 'eve', 'fox'];
 
-const profile = (userId: string, name = userId) => ({ userId, name, avatar: null });
+const profile = (userId: string, name = userId) =>
+  ({ userId, name, avatar: null, kind: 'guest' }) as const;
 
 function must(state: RoomState, actor: string, message: Parameters<typeof apply>[2]): RoomState {
   const outcome = apply(state, actor, message, { characters: BOARD, pick: pickFor(state) });

@@ -839,6 +839,113 @@ code {
   border-color: var(--accent);
 }
 
+/* Landing */
+
+.landing { gap: 0; }
+
+.landing h1 {
+  font-size: 34px;
+  letter-spacing: -0.02em;
+}
+
+.landing-blurb {
+  max-width: 42ch;
+  margin: 6px 0 26px;
+}
+
+.landing-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  max-width: 320px;
+  text-align: left;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.field input,
+.code-input {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-hover);
+  border-radius: 6px;
+  padding: 11px 13px;
+  font: inherit;
+  /* Anything under 16px makes iOS Safari zoom the page in on focus and never zoom back out. */
+  font-size: 16px;
+  width: 100%;
+}
+
+.field input:focus,
+.code-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Room codes are read aloud and typed by hand, so they get the treatment of a code. */
+.code-input,
+.room-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.landing-or {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.landing-or::before,
+.landing-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--surface-hover);
+}
+
+.join-row {
+  display: flex;
+  gap: 8px;
+}
+
+.join-row .code-input { flex: 1; min-width: 0; }
+
+/* The code in the header doubles as the share control. */
+.chip.is-code {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--surface-hover);
+}
+
+.chip.is-code .room-code {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.code-action {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.chip.is-code.is-active .code-action { color: #3ba55d; }
+
 /* Touch and small screens */
 
 /*

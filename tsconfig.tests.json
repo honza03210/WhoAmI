@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // Vitest runs on Node. Only the DOM-free parts of the client are reachable from here, which
+    // is why avatar.ts and errors.ts live apart from the modules that touch `window`.
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true
+  },
+  // Only the tests: TypeScript follows their imports, so the modules under test come along
+  // without dragging in the Worker entry points that need Cloudflare's globals.
+  "include": ["tests"]
+}

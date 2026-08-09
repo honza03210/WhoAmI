@@ -11,13 +11,23 @@ const decoder = new TextDecoder();
 
 const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
 
+/**
+ * How a player proved who they are.
+ *
+ * A Discord player was resolved through OAuth and their id is a real snowflake. A guest typed a
+ * name into a browser and was handed a random id by the Worker — the name is theirs to choose,
+ * the identity is not.
+ */
+export type IdentityKind = 'discord' | 'guest';
+
 export interface SessionProfile {
-  /** Discord user id, as resolved from GET /users/@me. */
+  /** Discord snowflake, or a server-issued guest id. Never supplied by the client. */
   uid: string;
   /** Display name, carried in the token so the room never has to trust the client for it. */
   name: string;
-  /** Discord avatar hash, or null for the default avatar. */
+  /** Discord avatar hash. Always null for guests, whose avatar is drawn from their id. */
   avatar: string | null;
+  kind: IdentityKind;
 }
 
 export interface SessionClaims extends SessionProfile {
@@ -31,10 +41,12 @@ function toBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function fromBase64Url(value: string): Uint8Array {
+// Backed by a plain ArrayBuffer rather than the wider ArrayBufferLike: Workers and Node disagree
+// about whether a possibly-shared buffer is acceptable to crypto.subtle, and this satisfies both.
+function fromBase64Url(value: string): Uint8Array<ArrayBuffer> {
   const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
   const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
@@ -81,6 +93,7 @@ export async function verifySession(secret: string, token: string): Promise<Sess
     if (typeof claims.uid !== 'string' || typeof claims.exp !== 'number') return null;
     if (typeof claims.name !== 'string') return null;
     if (claims.avatar !== null && typeof claims.avatar !== 'string') return null;
+    if (claims.kind !== 'discord' && claims.kind !== 'guest') return null;
     if (claims.exp < Date.now() / 1000) return null;
     return claims;
   } catch {

@@ -4,7 +4,7 @@ import { createSession, verifySession } from '../server/session';
 const SECRET = 'test-secret';
 const OTHER_SECRET = 'a-different-secret';
 const USER_ID = '123456789012345678';
-const PROFILE = { uid: USER_ID, name: 'Ada', avatar: null };
+const PROFILE = { uid: USER_ID, name: 'Ada', avatar: null, kind: 'discord' as const };
 
 describe('createSession / verifySession', () => {
   it('round-trips the user id', async () => {
@@ -20,13 +20,13 @@ describe('createSession / verifySession', () => {
 
   it('survives user ids and lengths that stress base64 padding', async () => {
     for (const uid of ['a', 'ab', 'abc', 'abcd', 'abcde', '0', '99999999999999999999']) {
-      const token = await createSession(SECRET, { uid, name: 'x', avatar: null });
+      const token = await createSession(SECRET, { uid, name: 'x', avatar: null, kind: 'discord' as const });
       await expect(verifySession(SECRET, token)).resolves.toMatchObject({ uid });
     }
   });
 
   it('round-trips non-ascii payloads', async () => {
-    const token = await createSession(SECRET, { uid: 'é中文-🎲', name: 'é中文-🎲', avatar: null });
+    const token = await createSession(SECRET, { uid: 'é中文-🎲', name: 'é中文-🎲', avatar: null, kind: 'discord' as const });
     await expect(verifySession(SECRET, token)).resolves.toMatchObject({ uid: 'é中文-🎲' });
   });
 
@@ -48,7 +48,7 @@ describe('verifySession rejects', () => {
     // The whole point: a client must not be able to rewrite its own user id.
     const token = await createSession(SECRET, PROFILE);
     const [, signature] = token.split('.');
-    const forgedPayload = Buffer.from(JSON.stringify({ uid: 'someone-else', name: 'x', avatar: null, exp: 2_000_000_000 }))
+    const forgedPayload = Buffer.from(JSON.stringify({ uid: 'someone-else', name: 'x', avatar: null, kind: 'discord', exp: 2_000_000_000 }))
       .toString('base64url');
     await expect(verifySession(SECRET, `${forgedPayload}.${signature}`)).resolves.toBeNull();
   });

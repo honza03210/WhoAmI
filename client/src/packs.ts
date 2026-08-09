@@ -41,7 +41,7 @@ export function packAsset(pack: PackManifest, file: string): string {
  * Derived from room state rather than fetched: the character list already arrives with every
  * state frame, so there is nothing left to ask the server for.
  */
-export function manifestFromCustomPack(pack: CustomPack, instanceId: string): PackManifest {
+export function manifestFromCustomPack(pack: CustomPack, roomKey: string): PackManifest {
   // A pack committed before the format was recorded holds WebP.
   const extension = PACK_IMAGE_EXTENSION[pack.format] ?? PACK_IMAGE_EXTENSION.webp;
 
@@ -56,7 +56,7 @@ export function manifestFromCustomPack(pack: CustomPack, instanceId: string): Pa
       full: `${character.id}@full.${extension}`,
     })),
     // Photos are addressed by room and by the pack's random token; see handlePack in index.ts.
-    baseUrl: apiPath(`/api/pack/${encodeURIComponent(instanceId)}/${pack.token}`),
+    baseUrl: apiPath(`/api/pack/${encodeURIComponent(roomKey)}/${pack.token}`),
   };
 }
 

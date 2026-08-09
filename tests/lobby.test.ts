@@ -3,7 +3,8 @@ import { apply, initialRoom, memberJoined, memberLeft, startBlockers } from '../
 import { viewFor } from '../server/redact';
 import type { RoomState } from '../server/protocol';
 
-const profile = (userId: string, name = userId) => ({ userId, name, avatar: null });
+const profile = (userId: string, name = userId) =>
+  ({ userId, name, avatar: null, kind: 'guest' }) as const;
 
 /** `startGame` needs a board; the identity of the faces is irrelevant to lobby rules. */
 const BOARD = ['ada', 'bob', 'cy', 'dee'];

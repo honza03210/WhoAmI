@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import type { ClientMessage, Member, RoomView, TeamId } from '../../../server/protocol';
 import { CUSTOM_PACK_ID, CUSTOM_PACK_MAX, CUSTOM_PACK_MIN, TEAM_IDS, TEAM_NAMES } from '../../../server/protocol';
 import type { PackSummary } from '../packs';
-import { avatarUrl } from '../avatar';
+import { avatarFor } from '../avatar';
 import type { UploadProgress } from '../customPack';
 import { ACCEPTED_TYPES, PackError, checkSelection, uploadCustomPack } from '../customPack';
 
@@ -11,11 +11,11 @@ interface LobbyProps {
   packs: PackSummary[];
   send: (message: ClientMessage) => void;
   session: string;
-  instanceId: string;
+  roomKey: string;
   onNotice: (message: string) => void;
 }
 
-export function Lobby({ view, packs, send, session, instanceId, onNotice }: LobbyProps) {
+export function Lobby({ view, packs, send, session, roomKey, onNotice }: LobbyProps) {
   const spectators = view.members.filter((member) => member.team === null);
   const canStart = view.startBlockers.length === 0;
 
@@ -51,7 +51,7 @@ export function Lobby({ view, packs, send, session, instanceId, onNotice }: Lobb
             packs={packs}
             send={send}
             session={session}
-            instanceId={instanceId}
+            roomKey={roomKey}
             onNotice={onNotice}
           />
         ) : (
@@ -112,14 +112,14 @@ function PackPicker({
   packs,
   send,
   session,
-  instanceId,
+  roomKey,
   onNotice,
 }: {
   view: RoomView;
   packs: PackSummary[];
   send: LobbyProps['send'];
   session: string;
-  instanceId: string;
+  roomKey: string;
   onNotice: (message: string) => void;
 }) {
   const input = useRef<HTMLInputElement | null>(null);
@@ -137,7 +137,7 @@ function PackPicker({
     try {
       // The room publishes the board itself on commit, so there is no selectPack to follow up
       // with — the next state frame already has it in play.
-      await uploadCustomPack(files, session, instanceId, setProgress);
+      await uploadCustomPack(files, session, roomKey, setProgress);
     } catch (error) {
       onNotice(error instanceof PackError ? error.message : `Upload failed: ${String(error)}`);
     } finally {
@@ -264,7 +264,7 @@ function PersonRow({ member, view }: { member: Member; view: RoomView }) {
   const isLeader = member.team !== null && view.leaders[member.team] === member.userId;
   return (
     <div className={member.connected ? 'person' : 'person is-away'}>
-      <img src={avatarUrl(member.userId, member.avatar)} alt="" width={28} height={28} />
+      <img src={avatarFor(member.userId, member.avatar, member.kind, member.name)} alt="" width={28} height={28} />
       <span className="person-name">{member.name}</span>
       {member.userId === view.hostId && <span className="tag">host</span>}
       {/* The leader is the only one who will see this team's secret, so the role is made obvious. */}

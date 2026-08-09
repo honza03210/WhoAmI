@@ -75,13 +75,13 @@ export function checkSelection(files: File[]): string | null {
 export async function uploadCustomPack(
   files: File[],
   session: string,
-  instanceId: string,
+  roomKey: string,
   onProgress: (progress: UploadProgress) => void,
 ): Promise<CustomPack> {
   const problem = checkSelection(files);
   if (problem) throw new PackError(problem);
 
-  const base = apiPath(`/api/pack/${encodeURIComponent(instanceId)}`);
+  const base = apiPath(`/api/pack/${encodeURIComponent(roomKey)}`);
   const auth = `session=${encodeURIComponent(session)}`;
 
   // Settled before any photo is touched: it decides both the encoding and the file names.

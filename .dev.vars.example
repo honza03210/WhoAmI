@@ -8,8 +8,3 @@ DISCORD_CLIENT_SECRET=your_oauth2_client_secret_here
 # Signs the session tokens the client presents when opening the game WebSocket.
 # Generate one with: openssl rand -base64 32
 SESSION_SECRET=generate_me
-
-# Set to "true" to expose /api/dev-session, which mints a session for a made-up user so the
-# lobby can be driven without Discord (used by `npm run test:e2e`). This file is local-only and
-# never deployed, so production cannot turn it on.
-ALLOW_DEV_SESSIONS=true

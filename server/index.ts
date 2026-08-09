@@ -1,5 +1,6 @@
 import type { Env } from './env';
 import { CUSTOM_PHOTO_MAX_BYTES } from './protocol';
+import { cleanDisplayName, generateGuestId, generateRoomCode, parseRoomKey, roomKeyForCode } from './rooms';
 import { createSession, verifySession } from './session';
 
 export { GameRoom } from './room';
@@ -36,8 +37,14 @@ export default {
           return request.method === 'POST'
             ? handleToken(request, env)
             : json({ error: 'method_not_allowed' }, 405);
-        case '/api/dev-session':
-          return handleDevSession(url, env);
+        case '/api/guest':
+          return request.method === 'POST'
+            ? handleGuest(request, env)
+            : json({ error: 'method_not_allowed' }, 405);
+        case '/api/rooms':
+          return request.method === 'POST'
+            ? handleCreateRoom(request, env)
+            : json({ error: 'method_not_allowed' }, 405);
         case '/api/ws':
           return handleWebSocket(request, url, env);
         default:
@@ -120,49 +127,81 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
       uid: user.id,
       name: displayName,
       avatar: user.avatar ?? null,
+      kind: 'discord',
     }),
     user: { id: user.id, username: user.username, displayName, avatar: user.avatar ?? null },
   });
 }
 
 /**
- * Mints a session for a fabricated user, so the lobby can be exercised — by hand or by the e2e
- * suite — without two real Discord accounts.
+ * Mints a session for somebody who typed a name into a browser.
  *
- * Only reachable when ALLOW_DEV_SESSIONS is set, which lives in .dev.vars and is therefore never
- * deployed. Absent that, the route 404s exactly like any other unknown path.
+ * The name is theirs to choose; the identity is not. The id is generated here and never read
+ * from the request, so a guest cannot claim a Discord player's id — or another guest's — by
+ * asking for it. That is the whole security model of guest play, so it lives in one place.
  */
-async function handleDevSession(url: URL, env: Env): Promise<Response> {
-  if (env.ALLOW_DEV_SESSIONS !== 'true') return json({ error: 'not_found' }, 404);
+async function handleGuest(request: Request, env: Env): Promise<Response> {
   if (!env.SESSION_SECRET) return json({ error: 'server_misconfigured' }, 500);
 
-  const name = (url.searchParams.get('name') ?? 'dev').slice(0, 32);
-  // Deterministic per name, so reconnecting as "alice" is the same player each time.
-  const uid = `dev-${name}`;
+  const body = (await readJson(request)) as { name?: unknown } | null;
+  const name = cleanDisplayName(body?.name);
+  if (!name) return json({ error: 'bad_name' }, 400);
 
+  const uid = generateGuestId();
   return json({
-    session: await createSession(env.SESSION_SECRET, { uid, name, avatar: null }),
+    session: await createSession(env.SESSION_SECRET, { uid, name, avatar: null, kind: 'guest' }),
     user: { id: uid, username: name, displayName: name, avatar: null },
   });
 }
 
 /**
+ * Opens a room that can be reached by link, and hands back its code.
+ *
+ * The code is the room: `idFromName` turns it straight into the Durable Object. What the DO call
+ * adds is a record that somebody meant to create it, so a mistyped code later reads as "no such
+ * room" rather than dropping the typist into an empty room of their own making.
+ */
+async function handleCreateRoom(request: Request, env: Env): Promise<Response> {
+  if (!env.SESSION_SECRET) return json({ error: 'server_misconfigured' }, 500);
+
+  const url = new URL(request.url);
+  const claims = await verifySession(env.SESSION_SECRET, url.searchParams.get('session') ?? '');
+  if (!claims) return json({ error: 'bad_session' }, 401);
+
+  const code = generateRoomCode();
+  const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomKeyForCode(code)));
+  const created = await room.fetch(new Request('https://room.invalid/room/create', { method: 'POST' }));
+  if (!created.ok) return json({ error: 'room_unavailable' }, 503);
+
+  return json({ code, roomKey: roomKeyForCode(code) });
+}
+
+/** Request bodies come from clients, so a malformed one is a 400 rather than an exception. */
+async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    return (await request.json()) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Routes custom pack requests to the room that owns them.
  *
- *   POST /api/pack/<instance>/begin              start an upload   (host, session required)
- *   POST /api/pack/<instance>/<token>/add        one photo         (uploader, session required)
- *   POST /api/pack/<instance>/<token>/commit     publish the board (uploader, session required)
- *   GET  /api/pack/<instance>/<token>/<file>     a photo           (token is the credential)
+ *   POST /api/pack/<roomKey>/begin              start an upload   (host, session required)
+ *   POST /api/pack/<roomKey>/<token>/add        one photo         (uploader, session required)
+ *   POST /api/pack/<roomKey>/<token>/commit     publish the board (uploader, session required)
+ *   GET  /api/pack/<roomKey>/<token>/<file>     a photo           (token is the credential)
  *
  * Reads are deliberately unauthenticated: they are `<img src>` targets inside the activity, and
  * a session in a URL ends up in history and referrers. The random token is what protects them.
  */
 async function handlePack(request: Request, url: URL, path: string, env: Env): Promise<Response> {
   const segments = path.split('/').slice(3).filter(Boolean); // after "/api/pack/"
-  const instanceId = segments[0] ?? '';
-  if (!isInstanceId(instanceId)) return json({ error: 'bad_instance' }, 400);
+  const roomKey = parseRoomKey(decodeURIComponent(segments[0] ?? ''));
+  if (!roomKey) return json({ error: 'bad_room' }, 400);
 
-  const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(instanceId));
+  const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(decodeURIComponent(segments[0] ?? '')));
   const forwarded = new URL(url);
   forwarded.pathname = `/pack/${segments.slice(1).join('/')}`;
 
@@ -195,11 +234,6 @@ async function handlePack(request: Request, url: URL, path: string, env: Env): P
 /** One photo plus headroom for the commit manifest. Anything larger is not a legitimate upload. */
 const MAX_UPLOAD_BODY_BYTES = 2 * CUSTOM_PHOTO_MAX_BYTES;
 
-/** Discord instance ids are opaque; bound the length and charset rather than trusting them. */
-function isInstanceId(value: string): boolean {
-  return /^[\w.:-]{1,128}$/.test(value);
-}
-
 /**
  * Upgrades to the room's WebSocket.
  *
@@ -207,13 +241,17 @@ function isInstanceId(value: string): boolean {
  * to the Durable Object in headers it can trust because the namespace is not publicly routable.
  */
 async function handleWebSocket(request: Request, url: URL, env: Env): Promise<Response> {
+  // The room is validated before the upgrade so a malformed key answers the same way whether or
+  // not the caller managed to ask for a WebSocket — which is also what makes it testable without
+  // one, since Node's fetch refuses to send the upgrade headers at all.
+  const rawKey = url.searchParams.get('room') ?? '';
+  const roomKey = parseRoomKey(rawKey);
+  if (!roomKey) return json({ error: 'bad_room' }, 400);
+
   if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
     return json({ error: 'expected_websocket' }, 426);
   }
   if (!env.SESSION_SECRET) return json({ error: 'server_misconfigured' }, 500);
-
-  const instanceId = url.searchParams.get('instance') ?? '';
-  if (!isInstanceId(instanceId)) return json({ error: 'bad_instance' }, 400);
 
   const claims = await verifySession(env.SESSION_SECRET, url.searchParams.get('session') ?? '');
   if (!claims) return json({ error: 'bad_session' }, 401);
@@ -223,7 +261,11 @@ async function handleWebSocket(request: Request, url: URL, env: Env): Promise<Re
   // Headers are latin-1; display names are not.
   headers.set('x-guessfi-user-name', encodeURIComponent(claims.name));
   headers.set('x-guessfi-user-avatar', claims.avatar ?? '');
+  headers.set('x-guessfi-user-kind', claims.kind);
+  // A Discord instance proves its own room exists. A code does not, so the room checks that
+  // somebody actually created it before letting anyone in.
+  headers.set('x-guessfi-room-kind', roomKey.kind);
 
-  const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(instanceId));
+  const room = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(rawKey));
   return room.fetch(new Request(url, { ...request, headers }));
 }

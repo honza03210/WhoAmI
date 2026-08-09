@@ -2,8 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientMessage, RoomView } from '../../server/protocol';
 import { CUSTOM_PACK_ID } from '../../server/protocol';
 import type { Connection } from './discord';
-import { connect, isEmbedded, leaveActivity } from './discord';
+import { connectDiscord, isEmbedded, leaveActivity } from './discord';
 import { describeError } from './errors';
+import type { StoredSession } from './join';
+import { createRoom, rememberedName, roomCodeFromUrl, roomKeyForCode, roomUrlFor, sessionForRoom } from './join';
+import { generatedAvatar } from './avatar';
+import { Landing } from './screens/Landing';
 import type { PackManifest, PackSummary } from './packs';
 import { loadPack, loadPackIndex, manifestFromCustomPack } from './packs';
 import type { ConnectionStatus, RoomClient } from './net';
@@ -12,50 +16,73 @@ import { Game } from './screens/Game';
 import { Lobby } from './screens/Lobby';
 
 type Status =
+  /** In a browser with no room in the URL: the landing screen decides what happens next. */
+  | { phase: 'landing' }
   | { phase: 'connecting' }
   | { phase: 'ready'; connection: Connection }
   | { phase: 'error'; message: string };
 
+/** A name in the URL skips the landing form — how a shared link and the e2e suite both arrive. */
+const nameFromUrl = new URLSearchParams(window.location.search).get('name') ?? '';
+
 export function App() {
-  const [status, setStatus] = useState<Status>({ phase: 'connecting' });
+  const [status, setStatus] = useState<Status>(() =>
+    isEmbedded || roomCodeFromUrl() ? { phase: 'connecting' } : { phase: 'landing' },
+  );
   const [packs, setPacks] = useState<PackSummary[]>([]);
   const [pack, setPack] = useState<PackManifest | null>(null);
   const [view, setView] = useState<RoomView | null>(null);
   const [connection, setConnection] = useState<ConnectionStatus>('connecting');
   const [notice, setNotice] = useState<string | null>(null);
   const [left, setLeft] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
 
   const room = useRef<RoomClient | null>(null);
 
+  /** Opens the socket for an established identity. Shared by both doors. */
+  const enterRoom = useCallback((established: Connection) => {
+    setStatus({ phase: 'ready', connection: established });
+    room.current?.close();
+    room.current = connectRoom(established.session, established.roomKey, {
+      onState: setView,
+      onStatus: setConnection,
+      onError: (error) => setNotice(error.message),
+    });
+  }, []);
+
+  // The Discord door, and the "someone sent me a link" door. The third case — a bare visit — is
+  // the landing screen, which does nothing until a name is typed.
   useEffect(() => {
     let cancelled = false;
+    const code = roomCodeFromUrl();
 
-    connect()
-      .then((established) => {
-        if (cancelled) return;
-        setStatus({ phase: 'ready', connection: established });
+    const arrive = async (): Promise<void> => {
+      if (isEmbedded) return enterRoom(await connectDiscord());
+      if (!code) return;
 
-        if (!established.session) {
-          setConnection('closed');
-          return;
-        }
-        room.current = connectRoom(established.session, established.instanceId, {
-          onState: setView,
-          onStatus: setConnection,
-          onError: (error) => setNotice(error.message),
-        });
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setStatus({ phase: 'error', message: describeError(error) });
-      });
+      const name = nameFromUrl.trim() || rememberedName();
+      // No name yet: fall back to the landing form rather than inventing one for them.
+      if (!name) {
+        setStatus({ phase: 'landing' });
+        return;
+      }
+      const roomKey = roomKeyForCode(code);
+      const stored = await sessionForRoom(roomKey, name);
+      enterRoom(guestConnection(stored, roomKey, code));
+    };
+
+    arrive().catch((error: unknown) => {
+      if (cancelled) return;
+      setStatus({ phase: 'error', message: describeError(error) });
+    });
 
     return () => {
       cancelled = true;
       room.current?.close();
       room.current = null;
     };
-  }, []);
+  }, [enterRoom]);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,12 +112,12 @@ export function App() {
   }, [view?.packId, pack?.id]);
 
   const customPack = view?.packId === CUSTOM_PACK_ID ? (view.customPack ?? null) : null;
-  const instanceId = status.phase === 'ready' ? status.connection.instanceId : null;
+  const roomKey = status.phase === 'ready' ? status.connection.roomKey : null;
   const customManifest = useMemo(
-    () => (customPack && instanceId ? manifestFromCustomPack(customPack, instanceId) : null),
+    () => (customPack && roomKey ? manifestFromCustomPack(customPack, roomKey) : null),
     // Keyed on the token rather than the object: room state is re-parsed every frame, so the
     // pack is a new object each time, but its token changes only when the photos do.
-    [customPack?.token, instanceId], // eslint-disable-line react-hooks/exhaustive-deps
+    [customPack?.token, roomKey], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   // Errors are transient: a rejected click shouldn't leave a banner up forever.
@@ -106,6 +133,47 @@ export function App() {
    * Leaves the room first, then asks Discord to close the activity. Closing the socket is what
    * actually takes the player out of the game, and it must not depend on Discord obliging.
    */
+  /**
+   * Joining puts the code in the URL before connecting, so the address bar is always shareable
+   * and a refresh lands in the same room rather than back on the front door.
+   */
+  const joinRoom = useCallback(
+    (name: string, code: string) => {
+      setJoinError(null);
+      setBusy('Joining…');
+      const key = roomKeyForCode(code);
+
+      sessionForRoom(key, name)
+        .then((stored) => {
+          window.history.replaceState(null, '', `/r/${code}`);
+          enterRoom(guestConnection(stored, key, code));
+        })
+        .catch((error: unknown) => {
+          setBusy(null);
+          setJoinError(describeError(error));
+        });
+    },
+    [enterRoom],
+  );
+
+  const openRoom = useCallback(
+    (name: string) => {
+      setJoinError(null);
+      setBusy('Opening…');
+
+      // A session is needed to create a room, and the room key is not known until it exists —
+      // so the first session is minted against a placeholder and the real one follows the code.
+      sessionForRoom('new', name)
+        .then((stored) => createRoom(stored.token))
+        .then((code) => joinRoom(name, code))
+        .catch((error: unknown) => {
+          setBusy(null);
+          setJoinError(describeError(error));
+        });
+    },
+    [joinRoom],
+  );
+
   const leave = useCallback(() => {
     room.current?.close();
     room.current = null;
@@ -113,8 +181,20 @@ export function App() {
     if (status.phase === 'ready') leaveActivity(status.connection.sdk);
   }, [status]);
 
+  if (status.phase === 'landing') {
+    return (
+      <Landing
+        initialName={nameFromUrl.trim() || rememberedName()}
+        joiningCode={roomCodeFromUrl()}
+        busy={busy}
+        error={joinError}
+        onCreate={openRoom}
+        onJoin={joinRoom}
+      />
+    );
+  }
   if (status.phase === 'connecting') {
-    return <main className="centered">Connecting to Discord…</main>;
+    return <main className="centered">{isEmbedded ? 'Connecting to Discord…' : 'Joining the room…'}</main>;
   }
   if (status.phase === 'error') {
     return (
@@ -142,7 +222,7 @@ export function App() {
     );
   }
 
-  const { user, session } = status.connection;
+  const { user, session, code } = status.connection;
 
   if (left) {
     return (
@@ -160,7 +240,7 @@ export function App() {
     <main>
       <header>
         <h1>guessFi</h1>
-        {!isEmbedded && <span className="badge">standalone</span>}
+        {code && <RoomCode code={code} />}
         <ConnectionPill status={connection} hasSession={session !== null} />
         <span className="spacer" />
         <span className="who">
@@ -175,16 +255,7 @@ export function App() {
 
       {notice && <p className="error notice">{notice}</p>}
 
-      {!session ? (
-        <section className="empty">
-          <h2>No game session</h2>
-          <p>
-            Running outside Discord without dev sessions enabled. Set{' '}
-            <code>ALLOW_DEV_SESSIONS=true</code> in <code>.dev.vars</code> and restart the Worker, or
-            open the activity inside Discord.
-          </p>
-        </section>
-      ) : !view ? (
+      {!view ? (
         <p className="muted">Joining the room…</p>
       ) : view.phase === 'lobby' ? (
         <Lobby
@@ -192,7 +263,7 @@ export function App() {
           packs={packs}
           send={send}
           session={session}
-          instanceId={status.connection.instanceId}
+          roomKey={status.connection.roomKey}
           onNotice={setNotice}
         />
       ) : (
@@ -200,6 +271,51 @@ export function App() {
       )}
     </main>
   );
+}
+
+/**
+ * The room's code, and the link that carries it.
+ *
+ * People join by being sent a URL far more often than by typing six characters, so copying the
+ * link is the primary action and the code is what you read out when that fails.
+ */
+function RoomCode({ code }: { code: string }) {
+  const [copied, setCopied] = useState(false);
+
+  return (
+    <button
+      type="button"
+      className={copied ? 'chip is-code is-active' : 'chip is-code'}
+      title="Copy the link to this room"
+      onClick={() => {
+        void navigator.clipboard
+          ?.writeText(roomUrlFor(code))
+          .then(() => setCopied(true))
+          // Clipboard access can be denied; the code is still on screen to read out.
+          .catch(() => undefined);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+    >
+      <span className="room-code">{code}</span>
+      <span className="code-action">{copied ? 'copied' : 'copy link'}</span>
+    </button>
+  );
+}
+
+/** A guest has no Discord profile, so their identity is entirely what the Worker issued them. */
+function guestConnection(stored: StoredSession, roomKey: string, code: string): Connection {
+  return {
+    sdk: null,
+    session: stored.token,
+    roomKey,
+    code,
+    user: {
+      id: stored.user.id,
+      username: stored.user.displayName,
+      displayName: stored.user.displayName,
+      avatarUrl: generatedAvatar(stored.user.id, stored.user.displayName),
+    },
+  };
 }
 
 function ConnectionPill({ status, hasSession }: { status: ConnectionStatus; hasSession: boolean }) {

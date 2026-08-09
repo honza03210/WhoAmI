@@ -22,8 +22,10 @@ export function otherTeam(team: TeamId): TeamId {
 export interface Member {
   userId: string;
   name: string;
-  /** Discord avatar hash, or null for the default avatar. */
+  /** Discord avatar hash, or null — for a guest, always null; their avatar is drawn from the id. */
   avatar: string | null;
+  /** Whether they came in through Discord or typed a name into a browser. */
+  kind: 'discord' | 'guest';
   /** null means watching rather than playing. */
   team: TeamId | null;
   ready: boolean;

@@ -1,17 +1,17 @@
 # guessFi
 
-Team Guess Who as a Discord Activity, played with your own photos.
+Team Guess Who, played with your own photos — as a Discord Activity, or from any browser.
 
 Two teams, each with a leader. Every team gets a secret character; teams take turns asking yes/no
-questions and flipping down tiles until a leader commits to a guess. Voice chat and the player
-roster come from Discord — the app only owns game state.
+questions and flipping down tiles until a leader commits to a guess.
 
 Runs entirely on Cloudflare's free tier.
 
-**Status: phases 1–4 of 6 complete.** A full game is playable: two teams pick leaders in a shared
-lobby, each leader is dealt a secret character only they can see, and the teams take turns asking
-yes/no questions and ruling faces out until a leader names the opponent's character. What's left is
-polish — layout modes, mobile, spectator UI, disconnect handling. See [Roadmap](#roadmap).
+**Status: a full game is playable, through either door.** In Discord the activity supplies the
+roster and the voice channel. In a browser you open a room, send someone the link, and play — see
+[Playing in a browser](#playing-in-a-browser), including the one thing that changes without voice
+chat. What's left is polish: layout modes, spectator UI, disconnect handling. See
+[Roadmap](#roadmap).
 
 ## Requirements
 
@@ -28,9 +28,39 @@ npm run packs         # encode them into public/packs/
 npm run dev:client
 ```
 
-Open http://localhost:5173. Outside Discord the app detects the missing `frame_id` param and
-falls back to `DiscordSDKMock`, so the UI renders with fake participants and no Discord app of
-your own. Good enough for UI work; useless for testing anything involving real identity.
+Open http://localhost:5173 — but for a real game you want the Worker too, since rooms live in it:
+
+```bash
+npm run dev           # Worker + Vite
+```
+
+Then open http://localhost:8787, type a name, and hit **Start a new room**. Open the `/r/<CODE>`
+URL it gives you in a second window (append `?name=someone-else`, or storage will recognise you as
+the same player) and you have two players without touching Discord.
+
+## Playing in a browser
+
+The host opens a room and gets a six-character code and a link. Anyone with either is in.
+
+- **Codes are join credentials.** Six characters from an alphabet with `O 0 I 1 L` removed, so
+  they survive being read aloud. Anyone who types one is in the room — redaction still holds, so a
+  walk-in sees no secrets, but rooms cap their members and turn newcomers away once a game is
+  running.
+- **Identity is server-issued.** `POST /api/guest` mints a session with an id the Worker generates;
+  the name is yours to pick, the identity is not. Nobody can claim someone else's seat by typing
+  their name.
+- **Your seat survives a refresh.** The session is kept per room in `localStorage`, so reloading
+  mid-game returns you to your own team and leader role rather than as a stranger. A different
+  name in the same browser is treated as a different player, which is what makes two people on one
+  laptop work.
+- **A mistyped code is not a room.** Rooms must be opened deliberately; a code nobody created
+  reports "no such room" instead of dropping you into an empty one of your own making.
+
+**What voice chat was doing.** The design leans on everyone being able to hear each other: secrets
+are leader-only *because* the team can talk, and **Pass** exists *because* questions get asked out
+loud. In a browser, bring your own call — the app does not carry voice, and in-app team chat is a
+deliberate open question rather than an oversight. See
+`~/.claude/plans/guessfi-browser-rooms.md`.
 
 ## Photo packs
 
@@ -135,7 +165,9 @@ Then repoint the root URL mapping from the tunnel to `guessfi.<your-subdomain>.w
 ## Layout
 
 ```
-client/src/discord.ts        SDK handshake, participant roster, the single place request paths are built
+client/src/discord.ts        SDK handshake, and the single place request paths are built
+client/src/join.ts           Room codes in the URL, guest sessions, localStorage
+client/src/screens/Landing.tsx  The front door for anyone not arriving through Discord
 client/src/net.ts            Room WebSocket, heartbeat and reconnect
 client/src/packs.ts          Pack index/manifest loading
 client/src/customPack.ts     Browser-side resize/encode and upload of the host's own photos
@@ -143,7 +175,8 @@ client/src/screens/Lobby.tsx Teams, leaders, pack choice, ready-up
 client/src/screens/Game.tsx  Turn banner, secret card, question log, guessing, endgame
 client/src/screens/Board.tsx The tile grid
 client/src/App.tsx           UI shell
-server/index.ts              Worker: routing, /api/token OAuth exchange, WS upgrade
+server/index.ts              Worker: routing, OAuth exchange, guest sessions, room creation
+server/rooms.ts              Room keys, codes, guest ids, display-name cleaning
 server/room.ts               GameRoom Durable Object: sockets, persistence, fan-out
 server/lobby.ts              Room rules as pure functions; dispatches in-game messages
 server/game.ts               Turn order, leader authority, guess resolution
@@ -219,8 +252,10 @@ unparseable JSON as "not built yet" rather than trusting the status code.
 | 2 | Photo pack pipeline and the board grid | ✅ done |
 | 3 | `GameRoom` Durable Object, WebSocket protocol, lobby with teams and leaders | ✅ done |
 | 4 | Game loop: secrets, questions, tile flips, guessing, endgame | ✅ done |
-| 5 | Layout modes, mobile, spectators, reconnect, room cleanup | next |
-| 6 | Deploy and smoke test | |
+| 5 | Layout modes, mobile, spectators, reconnect, room cleanup | mobile done; rest next |
+| 6 | Deploy and smoke test | ✅ done |
+| 7 | Browser rooms: codes, guest identity, shareable links | ✅ done |
+| 8 | Team chat, so a browser room works without voice | open — see the plan |
 
 ### Taking a turn
 

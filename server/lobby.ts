@@ -19,6 +19,7 @@ export interface Profile {
   userId: string;
   name: string;
   avatar: string | null;
+  kind: 'discord' | 'guest';
 }
 
 /**
@@ -83,7 +84,7 @@ export function memberJoined(state: RoomState, profile: Profile): RoomState {
   const members = existing
     ? state.members.map((member) =>
         member.userId === profile.userId
-          ? { ...member, name: profile.name, avatar: profile.avatar, connected: true }
+          ? { ...member, name: profile.name, avatar: profile.avatar, kind: profile.kind, connected: true }
           : member,
       )
     : [
@@ -92,6 +93,7 @@ export function memberJoined(state: RoomState, profile: Profile): RoomState {
           userId: profile.userId,
           name: profile.name,
           avatar: profile.avatar,
+          kind: profile.kind,
           team: null,
           ready: false,
           connected: true,

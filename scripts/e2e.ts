@@ -295,11 +295,38 @@ const BOARD_SCRIPT = `(async () => {
  * The browser test proves the UI wiring; this proves the room's rules and, crucially, that
  * rejections are enforced server-side rather than merely hidden by a disabled button.
  */
-async function connectClient(instance: string, name: string) {
-  const { session } = (await (await get(`${BASE_URL}/api/dev-session?name=${name}`)).json()) as {
-    session: string;
-  };
-  const socket = new WebSocket(`ws://127.0.0.1:${SERVER_PORT}/api/ws?instance=${instance}&session=${session}`);
+async function connectClient(roomKey: string, name: string) {
+  const identity = await guestSession(name);
+  return openSocket(roomKey, identity, name);
+}
+
+/** A guest identity, without a socket. What a browser stores in localStorage. */
+async function guestSession(name: string): Promise<{ session: string; userId: string }> {
+  const { session, user } = (await (
+    await get(`${BASE_URL}/api/guest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+  ).json()) as { session: string; user: { id: string } };
+
+  return { session, userId: user.id };
+}
+
+/**
+ * Reopens a socket with an identity the room already knows.
+ *
+ * This is what a browser refresh does: the session is in localStorage, so the same player comes
+ * back to their own seat rather than arriving as a stranger.
+ */
+async function reconnectClient(roomKey: string, previous: RoomClientLike) {
+  return openSocket(roomKey, { session: previous.session, userId: previous.userId }, previous.name);
+}
+
+async function openSocket(roomKey: string, identity: { session: string; userId: string }, name: string) {
+  const { session } = identity;
+  const room = encodeURIComponent(roomKey);
+  const socket = new WebSocket(`ws://127.0.0.1:${SERVER_PORT}/api/ws?room=${room}&session=${session}`);
   const states: RoomStateLike[] = [];
   const errors: { code: string }[] = [];
   // Kept verbatim: the redaction checks assert on the bytes, not on a parsed view that might
@@ -320,6 +347,9 @@ async function connectClient(instance: string, name: string) {
 
   return {
     name,
+    session,
+    /** Server-issued, so tests assert against the identity the room actually saw. */
+    userId: identity.userId,
     frames,
     send: (message: unknown) => socket.send(JSON.stringify(message)),
     close: () => socket.close(),
@@ -345,24 +375,30 @@ async function connectClient(instance: string, name: string) {
   };
 }
 
-type RoomClientLike = Awaited<ReturnType<typeof connectClient>>;
+type RoomClientLike = Awaited<ReturnType<typeof openSocket>>;
 
 async function checkRoomProtocol(): Promise<void> {
-  const instance = `e2e-proto-${Date.now()}`;
-  const connect = (name: string) => connectClient(instance, name);
+  const roomKey = `d:e2e-proto-${Date.now()}`;
+  const connect = (name: string) => connectClient(roomKey, name);
 
-  checkEqual('unauthenticated upgrade refused', (await get(`${BASE_URL}/api/ws?instance=x`)).status, 426);
+  // A real room key, so this asserts the upgrade requirement rather than key validation —
+  // malformed keys are covered in checkBrowserRooms.
+  checkEqual(
+    'a plain GET to the socket endpoint is refused',
+    (await get(`${BASE_URL}/api/ws?room=${encodeURIComponent('d:whatever')}`)).status,
+    426,
+  );
 
   const alice = await connect('alice');
   await alice.until((state) => state.members.length === 1);
-  checkEqual('first joiner is host', alice.latest()?.hostId, 'dev-alice');
+  checkEqual('first joiner is host', alice.latest()?.hostId, alice.userId);
 
   const bob = await connect('bob');
   await Promise.all([alice.until((s) => s.members.length === 2), bob.until((s) => s.members.length === 2)]);
   check('both clients see both members', true);
 
   alice.send({ type: 'setTeam', team: 'a' });
-  await bob.until((state) => state.leaders.a === 'dev-alice');
+  await bob.until((state) => state.leaders.a === alice.userId);
   check('team change and leadership propagate', true);
 
   bob.send({ type: 'selectPack', packId: 'demo' });
@@ -392,16 +428,18 @@ async function checkRoomProtocol(): Promise<void> {
 
   // Mid-game departures are remembered so the player can come back to their team.
   bob.close();
-  await alice.until((state) => state.members.find((m) => m.userId === 'dev-bob')?.connected === false);
+  await alice.until((state) => state.members.find((m) => m.userId === bob.userId)?.connected === false);
   checkEqual('a departed player is kept mid-game', alice.latest()?.members.length, 2);
 
-  const bobAgain = await connect('bob');
-  const restored = await bobAgain.until((state) => state.you.userId === 'dev-bob' && state.you.team === 'b');
+  // Reconnecting means presenting the same identity, which is what a stored session gives a
+  // browser; here the socket is reopened with the id the room already knows.
+  const bobAgain = await reconnectClient(roomKey, bob);
+  const restored = await bobAgain.until((state) => state.you.userId === bob.userId && state.you.team === 'b');
   checkEqual('reconnect restores the team', restored.you.team, 'b');
-  checkEqual('reconnect restores leadership', restored.leaders.b, 'dev-bob');
+  checkEqual('reconnect restores leadership', restored.leaders.b, bob.userId);
   checkEqual(
     'reconnect does not duplicate the player',
-    restored.members.filter((m) => m.userId === 'dev-bob').length,
+    restored.members.filter((m) => m.userId === bob.userId).length,
     1,
   );
 
@@ -414,7 +452,7 @@ interface RoomStateLike {
   hostId: string | null;
   packId: string | null;
   leaders: { a: string | null; b: string | null };
-  members: { userId: string; team: string | null; connected: boolean; ready: boolean }[];
+  members: { userId: string; team: string | null; connected: boolean; ready: boolean; kind: string }[];
   startBlockers: string[];
   you: { userId: string; team: string | null; isHost: boolean; isLeader: boolean };
   customPack: { token: string; name: string; characters: { id: string; name: string }[] } | null;
@@ -444,8 +482,8 @@ interface RoomStateLike {
  * secret nor which faces have been ruled out.
  */
 async function checkGameProtocol(packId: string, characterIds: string[]): Promise<void> {
-  const instance = `e2e-game-${Date.now()}`;
-  const connect = (name: string) => connectClient(instance, name);
+  const roomKey = `d:e2e-game-${Date.now()}`;
+  const connect = (name: string) => connectClient(roomKey, name);
 
   const alice = await connect('alice'); // Red leader, and host
   const carol = await connect('carol'); // Red, not leader
@@ -460,7 +498,7 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
   carol.send({ type: 'setTeam', team: 'a' });
   bob.send({ type: 'setTeam', team: 'b' });
   erin.send({ type: 'setTeam', team: 'b' });
-  await alice.until((state) => state.leaders.a === 'dev-alice' && state.leaders.b === 'dev-bob');
+  await alice.until((state) => state.leaders.a === alice.userId && state.leaders.b === bob.userId);
 
   alice.send({ type: 'selectPack', packId });
   for (const player of [alice, carol, bob, erin]) player.send({ type: 'setReady', ready: true });
@@ -474,16 +512,20 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
   let blueSecret: string | null | undefined;
 
   for (let attempt = 0; attempt < 12; attempt++) {
-    alice.send({ type: 'startGame' });
+    if (attempt === 0) {
+      alice.send({ type: 'startGame' });
+    } else {
+      // Redealing means finishing the hand first — `playAgain` only exists at an endgame, and
+      // ending it with a guess is the one move always available to the team on turn.
+      alice.send({ type: 'submitGuess', characterId: characterIds[0] ?? '' });
+      for (const client of everyone) await client.until((state) => state.phase === 'endgame');
+      alice.send({ type: 'playAgain' });
+    }
+
     for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
     redSecret = alice.latest()?.game?.yourSecret;
     blueSecret = bob.latest()?.game?.yourSecret;
     if (redSecret !== blueSecret) break;
-
-    alice.send({ type: 'rematch' });
-    for (const client of everyone) await client.until((state) => state.phase === 'lobby');
-    for (const player of [alice, carol, bob, erin]) player.send({ type: 'setReady', ready: true });
-    await alice.until((state) => state.startBlockers.length === 0);
   }
 
   check('a spectator does not block the start', true);
@@ -636,7 +678,7 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
   checkEqual('play again clears the boards', alice.latest()?.game?.flipped['a'], []);
   // The board itself is never sent to clients, so the pack is what there is to check.
   checkEqual('play again keeps the same pack', alice.latest()?.packId, packId);
-  checkEqual('play again keeps the leaders', alice.latest()?.leaders.a, 'dev-alice');
+  checkEqual('play again keeps the leaders', alice.latest()?.leaders.a, alice.userId);
   check('play again deals a character again', typeof alice.latest()?.game?.yourSecret === 'string');
 
   // Finish the second game so the rematch path can be exercised from a real endgame.
@@ -648,8 +690,8 @@ async function checkGameProtocol(packId: string, characterIds: string[]): Promis
 
   alice.send({ type: 'rematch' });
   await carol.until((state) => state.phase === 'lobby');
-  checkEqual('a rematch keeps the teams', carol.latest()?.members.find((m) => m.userId === 'dev-carol')?.team, 'a');
-  checkEqual('a rematch keeps the leaders', carol.latest()?.leaders.b, 'dev-bob');
+  checkEqual('a rematch keeps the teams', carol.latest()?.members.find((m) => m.userId === carol.userId)?.team, 'a');
+  checkEqual('a rematch keeps the leaders', carol.latest()?.leaders.b, bob.userId);
   checkEqual('a rematch clears the game', carol.latest()?.game, null);
   check(
     'a rematch clears readiness',
@@ -685,6 +727,41 @@ const PAGE_HELPERS = `
   const namesIn = (team) => [...(teamPanel(team)?.querySelectorAll('.person-name') ?? [])].map(el => el.textContent);
   const memberCount = () => document.querySelectorAll('.person').length;
 `;
+
+interface OpenRoomReport {
+  sawLanding: boolean;
+  code: string;
+  url: string;
+  headerCode: string;
+}
+
+/**
+ * The front door, driven the way a first-time visitor meets it: land on the site, give a name,
+ * open a room. What comes back is the code the second player will be sent.
+ */
+async function runOpenRoomFlow(page: Awaited<ReturnType<typeof openPage>>): Promise<OpenRoomReport> {
+  const evalOn = <T,>(body: string) => page.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  const sawLanding = await evalOn<boolean>(
+    `await wait(() => byText('button', 'Start a new room'));
+     // ?name= prefills, so the form is ready to submit without typing.
+     return document.querySelector('.field input').value === 'alice';`,
+  );
+
+  await evalOn<boolean>(`byText('button', 'Start a new room').click(); return true;`);
+
+  const opened = await evalOn<{ code: string; url: string; headerCode: string }>(
+    `await wait(() => document.querySelector('.teams'), 20000);
+     const chip = await wait(() => document.querySelector('.chip.is-code .room-code'));
+     return {
+       code: chip.textContent.trim(),
+       url: location.pathname,
+       headerCode: chip.textContent.trim(),
+     };`,
+  );
+
+  return { sawLanding, ...opened };
+}
 
 async function runLobbyFlow(
   alice: Awaited<ReturnType<typeof openPage>>,
@@ -752,6 +829,113 @@ async function runLobbyFlow(
 }
 
 /**
+ * Opens a socket and reports whether the room turned it away.
+ *
+ * The Worker answers a refusal with an ordinary HTTP response instead of completing the upgrade,
+ * which a WebSocket client can only observe as "it did not open".
+ */
+async function socketRefused(roomKey: string, session: string): Promise<boolean> {
+  const socket = new WebSocket(
+    `ws://127.0.0.1:${SERVER_PORT}/api/ws?room=${encodeURIComponent(roomKey)}&session=${encodeURIComponent(session)}`,
+  );
+
+  return new Promise<boolean>((resolve) => {
+    const settle = (refused: boolean) => {
+      socket.onopen = socket.onerror = socket.onclose = null;
+      if (!refused) socket.close();
+      resolve(refused);
+    };
+    socket.onopen = () => settle(false);
+    socket.onerror = () => settle(true);
+    socket.onclose = () => settle(true);
+    setTimeout(() => settle(false), 4000);
+  });
+}
+
+/**
+ * Rooms reached by a code rather than by a Discord activity.
+ *
+ * The addressing is the whole feature here: a code has to open the room it names, a code nobody
+ * opened has to be refused rather than quietly conjured into existence, and the two namespaces
+ * must not overlap.
+ */
+async function checkBrowserRooms(): Promise<void> {
+  const host = await guestSession('alice');
+
+  checkEqual(
+    'a nameless guest is refused',
+    (
+      await get(`${BASE_URL}/api/guest`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '   ' }),
+      })
+    ).status,
+    400,
+  );
+  checkEqual(
+    'creating a room needs a session',
+    (await get(`${BASE_URL}/api/rooms`, { method: 'POST' })).status,
+    401,
+  );
+
+  const created = await get(`${BASE_URL}/api/rooms?session=${encodeURIComponent(host.session)}`, {
+    method: 'POST',
+  });
+  checkEqual('a room is created', created.status, 200);
+  const { code } = (await created.json()) as { code: string };
+  check('the code is six unambiguous characters', /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/.test(code), code);
+
+  // An unopened code must not become a room just because somebody typed it. Probed with a real
+  // socket: Node's fetch refuses to send the upgrade headers, so an HTTP probe cannot get here.
+  check('an unopened code is not a room', await socketRefused('c:ZZZZZZ', host.session));
+
+  for (const bad of ['c:abc', 'c:ABCDE0', 'nonsense', '']) {
+    const response = await get(
+      `${BASE_URL}/api/ws?room=${encodeURIComponent(bad)}&session=${encodeURIComponent(host.session)}`,
+    );
+    checkEqual(`a malformed room key is refused (${bad || 'empty'})`, response.status, 400);
+  }
+
+  const roomKey = `c:${code}`;
+  const alice = await openSocket(roomKey, host, 'alice');
+  const bob = await connectClient(roomKey, 'bob');
+  await alice.until((state) => state.members.length === 2);
+  check('two browsers reach the same room by code', true);
+  checkEqual('the room creator is the host', alice.latest()?.hostId, alice.userId);
+  checkEqual('guests are marked as guests', alice.latest()?.members[0]?.kind, 'guest');
+
+  // A Discord instance that happens to spell a code must not share its room.
+  const namesake = await connectClient(`d:${code}`, 'stranger');
+  await namesake.until((state) => state.members.length === 1);
+  checkEqual('the two addressing spaces do not overlap', namesake.latest()?.members.length, 1);
+  namesake.close();
+
+  // Once a game is running, a code in the wrong hands must not put someone in the middle of it.
+  alice.send({ type: 'setTeam', team: 'a' });
+  bob.send({ type: 'setTeam', team: 'b' });
+  alice.send({ type: 'selectPack', packId: 'demo' });
+  alice.send({ type: 'setReady', ready: true });
+  bob.send({ type: 'setReady', ready: true });
+  await alice.until((state) => state.startBlockers.length === 0);
+  alice.send({ type: 'startGame' });
+  await alice.until((state) => state.phase === 'in_progress');
+
+  const latecomer = await guestSession('gatecrasher');
+  check('a stranger cannot walk into a running game', await socketRefused(roomKey, latecomer.session));
+
+  // ...but the people already playing can always come back.
+  bob.close();
+  await alice.until((state) => state.members.some((m) => m.userId === bob.userId && !m.connected));
+  const bobAgain = await reconnectClient(roomKey, bob);
+  const restored = await bobAgain.until((state) => state.you.userId === bob.userId);
+  checkEqual('a player who was already in can rejoin mid-game', restored.you.team, 'b');
+
+  alice.close();
+  bobAgain.close();
+}
+
+/**
  * A game that loses a whole team.
  *
  * Its own room, because it ends with players gone and would poison any assertion made after it.
@@ -759,9 +943,9 @@ async function runLobbyFlow(
  * can take.
  */
 async function checkAbandonedGame(packId: string): Promise<void> {
-  const instance = `e2e-abandon-${Date.now()}`;
-  const alice = await connectClient(instance, 'alice'); // host, Red
-  const bob = await connectClient(instance, 'bob'); // Blue, on their own
+  const roomKey = `d:e2e-abandon-${Date.now()}`;
+  const alice = await connectClient(roomKey, 'alice'); // host, Red
+  const bob = await connectClient(roomKey, 'bob'); // Blue, on their own
 
   await alice.until((state) => state.members.length === 2);
   alice.send({ type: 'setTeam', team: 'a' });
@@ -803,17 +987,13 @@ async function checkAbandonedGame(packId: string): Promise<void> {
  */
 async function checkCustomPack(): Promise<void> {
   const sharp = (await import('sharp')).default;
-  const instance = `e2e-custom-${Date.now()}`;
-
-  const sessionFor = async (name: string) =>
-    ((await (await get(`${BASE_URL}/api/dev-session?name=${name}`)).json()) as { session: string }).session;
-
-  const alice = await connectClient(instance, 'alice'); // host
-  const bob = await connectClient(instance, 'bob');
+  const roomKey = `d:e2e-custom-${Date.now()}`;
+  const alice = await connectClient(roomKey, 'alice'); // host
+  const bob = await connectClient(roomKey, 'bob');
   await alice.until((state) => state.members.length === 2);
 
-  const [aliceSession, bobSession] = [await sessionFor('alice'), await sessionFor('bob')];
-  const base = `${BASE_URL}/api/pack/${instance}`;
+  const [aliceSession, bobSession] = [alice.session, bob.session];
+  const base = `${BASE_URL}/api/pack/${encodeURIComponent(roomKey)}`;
   const post = (url: string, init: RequestInit = {}) => get(url, { method: 'POST', ...init });
 
   const refused = await post(`${base}/begin?session=${bobSession}`, { body: '{}' });
@@ -1409,8 +1589,6 @@ async function main(): Promise<void> {
         // Supplied on the command line rather than via .dev.vars so CI, which has no such file,
         // can still exercise the room. Both are throwaway values scoped to this run.
         '--var',
-        'ALLOW_DEV_SESSIONS:true',
-        '--var',
         `SESSION_SECRET:${randomUUID()}`,
       ],
       ['ignore', 'ignore', 'pipe'],
@@ -1475,6 +1653,9 @@ async function main(): Promise<void> {
       await checkAbandonedGame(firstPack.id);
     }
 
+    console.log('\nRooms reached by code');
+    await checkBrowserRooms();
+
     console.log('\nCustom photo pack');
     await checkCustomPack();
 
@@ -1494,11 +1675,19 @@ async function main(): Promise<void> {
     );
 
     await waitFor('Chrome', async () => (await get(`http://127.0.0.1:${DEBUG_PORT}/json/version`)).ok);
-    // Two pages, two dev users, one room — the milestone this phase is aiming at.
-    const instance = `e2e-${Date.now()}`;
-    const alice = await openPage(`${BASE_URL}/?user=alice&instance=${instance}`);
-    const bob = await openPage(`${BASE_URL}/?user=bob&instance=${instance}`);
 
+    // The real journey: one person opens a room from the landing screen, the other follows the
+    // link. No Discord anywhere in it.
+    console.log('\nOpening a room from the landing screen');
+    const alice = await openPage(`${BASE_URL}/?name=alice`);
+    const opened = await runOpenRoomFlow(alice);
+    check('the landing screen offers a way in', opened.sawLanding);
+    check('opening a room puts the code in the address bar', /\/r\/[A-Z0-9]{6}$/.test(opened.url), opened.url);
+    check('the code is shown in the header', opened.headerCode === opened.code, opened);
+
+    const bob = await openPage(`${BASE_URL}/r/${opened.code}?name=bob`);
+
+    console.log('\nLobby (two browsers)');
     const lobby = await runLobbyFlow(alice, bob);
     checkEqual('both players listed for alice', lobby.aliceSeesMembers, 2);
     checkEqual('both players listed for bob', lobby.bobSeesMembers, 2);

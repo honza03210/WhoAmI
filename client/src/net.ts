@@ -25,11 +25,11 @@ const MAX_BACKOFF_MS = 10_000;
  * The server always sends complete state rather than deltas, so a reconnect needs no replay:
  * whatever arrives first after reopening is the truth.
  */
-export function connectRoom(session: string, instanceId: string, handlers: RoomHandlers): RoomClient {
+export function connectRoom(session: string, roomKey: string, handlers: RoomHandlers): RoomClient {
   const url = new URL(apiPath('/api/ws'), window.location.href);
   url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('session', session);
-  url.searchParams.set('instance', instanceId);
+  url.searchParams.set('room', roomKey);
 
   let socket: WebSocket | null = null;
   let heartbeat: ReturnType<typeof setInterval> | undefined;

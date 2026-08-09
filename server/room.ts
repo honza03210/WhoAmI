@@ -38,6 +38,12 @@ const IDLE_CLEANUP_MS = 6 * 60 * 60 * 1000;
 
 const STORAGE_KEY = 'room';
 
+/** Set when a code room is opened on purpose; absent means the code was never handed out. */
+const CREATED_KEY = 'created';
+
+/** Two full teams, their leaders and a gallery. Past this a code room is being abused. */
+const MAX_MEMBERS = 32;
+
 /** Keepalives are answered by the runtime, so they never wake a hibernating room. */
 const PING = JSON.stringify({ type: 'ping' });
 const PONG = JSON.stringify({ type: 'pong' });
@@ -60,15 +66,28 @@ export class GameRoom extends DurableObject<Env> {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/pack/')) return this.handlePack(request, url);
+    if (url.pathname === '/room/create') return this.handleCreate();
 
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected a WebSocket upgrade', { status: 426 });
+    }
+
+    // `idFromName` hands back a live object for any string, so without this a mistyped code
+    // would quietly open an empty room and leave the typist waiting in it. A Discord instance
+    // needs no such proof: the id only exists because Discord made the activity.
+    if (request.headers.get('x-guessfi-room-kind') === 'code') {
+      if (!(await this.ctx.storage.get<number>(CREATED_KEY))) {
+        return Response.json({ error: 'no_such_room' }, { status: 404 });
+      }
     }
 
     // The Worker verified the session and put the identity here. A Durable Object namespace is
     // not publicly routable, so these headers cannot come from outside.
     const profile = profileFromHeaders(request.headers);
     if (!profile) return new Response('Missing identity', { status: 401 });
+
+    const rejection = this.admissionRefusal(profile.userId);
+    if (rejection) return Response.json({ error: rejection }, { status: 403 });
 
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server);
@@ -149,6 +168,30 @@ export class GameRoom extends DurableObject<Env> {
     this.room = memberLeft(this.room, profile.userId);
     await this.persist();
     this.broadcast();
+  }
+
+  /** Marks a code room as deliberately opened. Idempotent: creating twice is not an error. */
+  private async handleCreate(): Promise<Response> {
+    if (!(await this.ctx.storage.get<number>(CREATED_KEY))) {
+      await this.ctx.storage.put(CREATED_KEY, Date.now());
+      await this.ctx.storage.setAlarm(Date.now() + IDLE_CLEANUP_MS);
+    }
+    return Response.json({ ok: true });
+  }
+
+  /**
+   * Why somebody may not come in, or null if they may.
+   *
+   * A room reachable by a six-character code will eventually have the wrong person type the
+   * right code. Redaction means a walk-in learns no secrets, but they can still fill a lobby or
+   * wander into a game in progress, so both are bounded. Anyone already in the room is always let
+   * back in — that is a reconnect, and the game is holding their team for them.
+   */
+  private admissionRefusal(userId: string): string | null {
+    if (this.room.members.some((member) => member.userId === userId)) return null;
+    if (this.room.members.length >= MAX_MEMBERS) return 'room_full';
+    if (this.room.phase !== 'lobby') return 'game_in_progress';
+    return null;
   }
 
   /**
@@ -352,5 +395,6 @@ function profileFromHeaders(headers: Headers): Profile | null {
   }
 
   const avatar = headers.get('x-guessfi-user-avatar');
-  return { userId, name, avatar: avatar ? avatar : null };
+  const kind = headers.get('x-guessfi-user-kind') === 'guest' ? 'guest' : 'discord';
+  return { userId, name, avatar: avatar ? avatar : null, kind };
 }
