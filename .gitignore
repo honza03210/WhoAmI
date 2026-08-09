@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.wrangler/
+
+# Local secrets — never commit these
+.env
+.dev.vars
+
+# Generated from packs/ by `npm run packs`
+public/packs/
+
+.DS_Store
+*.log

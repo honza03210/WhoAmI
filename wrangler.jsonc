@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "guessfi",
+  "main": "server/index.ts",
+  "compatibility_date": "2026-08-01",
+
+  "vars": {
+    // Public. The OAuth2 client secret lives in `.dev.vars` / `wrangler secret`, never here.
+    "DISCORD_CLIENT_ID": ""
+  },
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    // The client is a single-page app: unknown paths serve index.html rather than 404.
+    "not_found_handling": "single-page-application",
+    // Everything not listed here is served straight off the asset layer, which is free and
+    // unmetered. "/.proxy/*" is defensive: with a root URL mapping Discord forwards bare
+    // paths, but some proxy setups keep the prefix, and the Worker strips it either way.
+    "run_worker_first": ["/api/*", "/.proxy/*"]
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

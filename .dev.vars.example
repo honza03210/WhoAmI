@@ -1,0 +1,10 @@
+# Copy to `.dev.vars`. Read by `wrangler dev` only — these never reach the client.
+# For production set them with:
+#   wrangler secret put DISCORD_CLIENT_SECRET
+#   wrangler secret put SESSION_SECRET
+
+DISCORD_CLIENT_SECRET=your_oauth2_client_secret_here
+
+# Signs the session tokens the client presents when opening the game WebSocket.
+# Generate one with: openssl rand -base64 32
+SESSION_SECRET=generate_me
