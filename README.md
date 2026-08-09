@@ -8,8 +8,9 @@ roster come from Discord — the app only owns game state.
 
 Runs entirely on Cloudflare's free tier.
 
-**Status: phase 1 of 6 complete.** The activity boots inside Discord, authenticates, and shows the
-live participant list. The game itself is not built yet — see [Roadmap](#roadmap).
+**Status: phases 1–2 of 6 complete.** The activity boots inside Discord, authenticates, and renders
+a photo board you can flip tiles on. There is no multiplayer yet — flipping is local state, and
+teams, turns, and secrets arrive in phases 3–4. See [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -21,12 +22,22 @@ live participant list. The game itself is not built yet — see [Roadmap](#roadm
 
 ```bash
 npm install
+npm run demo-pack     # 24 placeholder portraits, so there's a board to look at
+npm run packs         # encode them into public/packs/
 npm run dev:client
 ```
 
 Open http://localhost:5173. Outside Discord the app detects the missing `frame_id` param and
 falls back to `DiscordSDKMock`, so the UI renders with fake participants and no Discord app of
 your own. Good enough for UI work; useless for testing anything involving real identity.
+
+## Photo packs
+
+Drop photos into `packs/<pack-name>/` and run `npm run packs`. Filenames become character names.
+Full details — naming rules, `pack.json` overrides, what the encoder does — in
+[`packs/README.md`](packs/README.md).
+
+`npm run build` runs the pack build first, so a deploy always ships current packs.
 
 ## Running inside Discord
 
@@ -97,15 +108,19 @@ Then repoint the root URL mapping from the tunnel to `guessfi.<your-subdomain>.w
 ## Layout
 
 ```
-client/src/discord.ts   SDK handshake, participant roster, the single place request paths are built
-client/src/App.tsx      UI shell
-server/index.ts         Worker: routing, /api/token OAuth exchange
-server/session.ts       HMAC session tokens (Web Crypto)
-wrangler.jsonc          Worker + static asset config
+client/src/discord.ts        SDK handshake, participant roster, the single place request paths are built
+client/src/packs.ts          Pack index/manifest loading
+client/src/screens/Board.tsx The tile grid
+client/src/App.tsx           UI shell
+server/index.ts              Worker: routing, /api/token OAuth exchange
+server/session.ts            HMAC session tokens (Web Crypto)
+scripts/build-packs.ts       photos -> square WebP tiles + manifests
+scripts/make-demo-pack.ts    generates the placeholder pack
+wrangler.jsonc               Worker + static asset config
 ```
 
-`npm run typecheck` checks both projects — client and Worker have separate tsconfigs so DOM and
-Workers globals never leak into each other.
+`npm run typecheck` checks all three projects — client, Worker, and build scripts each have their
+own tsconfig so DOM, Workers, and Node globals never leak into each other.
 
 ## Networking notes
 
@@ -125,13 +140,17 @@ both forms work if a future proxy change starts sending it.
 To reach a third-party origin later, add a URL mapping in the portal and route the request through
 `apiPath()` in `client/src/discord.ts` rather than hardcoding a host.
 
+One consequence of `not_found_handling: "single-page-application"`: a missing asset returns
+**200 with index.html**, not a 404. `fetchJson` in `client/src/packs.ts` therefore treats
+unparseable JSON as "not built yet" rather than trusting the status code.
+
 ## Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Scaffold, Discord handshake, participant list | ✅ done |
-| 2 | Photo pack pipeline (`scripts/build-packs.ts`, sharp → square webp + manifest) | next |
-| 3 | `GameRoom` Durable Object, WebSocket protocol, lobby with teams and leaders | |
+| 2 | Photo pack pipeline and the board grid | ✅ done |
+| 3 | `GameRoom` Durable Object, WebSocket protocol, lobby with teams and leaders | next |
 | 4 | Game loop: secrets, questions, tile flips, guessing, endgame | |
 | 5 | Layout modes, mobile, spectators, reconnect, room cleanup | |
 | 6 | Deploy and smoke test | |

@@ -3,6 +3,7 @@
 :root {
   --bg: #1e1f22;
   --surface: #2b2d31;
+  --surface-hover: #35373c;
   --text: #dbdee1;
   --muted: #949ba4;
   --accent: #5865f2;
@@ -27,7 +28,7 @@ body {
 main {
   max-width: 720px;
   margin: 0 auto;
-  padding: 20px 16px 40px;
+  padding: 16px 16px 48px;
 }
 
 main.centered {
@@ -43,13 +44,13 @@ main.centered {
 header {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 
 h1 {
-  font-size: 22px;
+  font-size: 20px;
   margin: 0;
 }
 
@@ -65,6 +66,22 @@ section + section {
   margin-top: 28px;
 }
 
+.spacer {
+  flex: 1;
+}
+
+.who {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.who img {
+  border-radius: 50%;
+}
+
 .badge {
   background: var(--surface);
   color: var(--muted);
@@ -75,15 +92,163 @@ section + section {
 
 .error {
   color: var(--danger);
-  max-width: 40ch;
+  max-width: 48ch;
 }
+
+.muted {
+  color: var(--muted);
+}
+
+.empty {
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.empty p {
+  margin: 0;
+  color: var(--muted);
+}
+
+code {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13px;
+}
+
+/* Pack switcher */
+
+.pack-switcher {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.chip {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 5px 13px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.chip:hover {
+  background: var(--surface-hover);
+}
+
+.chip.is-active {
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* Board */
+
+.board-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.link-button:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.link-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Classic Guess Who is 4x6. Narrow frames (Discord's picture-in-picture layout, phones)
+   get 4 columns; anything wider gets the full 6. */
+.board {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+@media (min-width: 520px) {
+  .board {
+    grid-template-columns: repeat(6, 1fr);
+  }
+}
+
+.tile {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s ease, opacity 0.12s ease;
+}
+
+.tile:hover {
+  border-color: var(--accent);
+}
+
+.tile img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+.tile-name {
+  display: block;
+  padding: 5px 4px;
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Ruled out: dimmed and desaturated, but still legible — you need to remember who's gone. */
+.tile.is-flipped {
+  opacity: 0.35;
+}
+
+.tile.is-flipped img {
+  filter: grayscale(1);
+}
+
+.tile.is-flipped .tile-name {
+  text-decoration: line-through;
+}
+
+/* People */
 
 .people {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .person {
@@ -92,7 +257,7 @@ section + section {
   gap: 10px;
   background: var(--surface);
   border-radius: 8px;
-  padding: 8px 12px;
+  padding: 6px 12px;
 }
 
 .person img {
