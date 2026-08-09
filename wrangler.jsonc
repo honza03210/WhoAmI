@@ -6,7 +6,7 @@
 
   "vars": {
     // Public. The OAuth2 client secret lives in `.dev.vars` / `wrangler secret`, never here.
-    "DISCORD_CLIENT_ID": "1535978877573406841"
+    "DISCORD_CLIENT_ID": "1536065683283120228"
   },
 
   // One room per Discord activity instance. SQLite-backed so it is available on the free plan.

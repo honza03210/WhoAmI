@@ -1,5 +1,6 @@
 import { DiscordSDK, DiscordSDKMock, RPCCloseCodes } from '@discord/embedded-app-sdk';
 import { avatarUrl } from './avatar';
+import { describeError } from './errors';
 import type { EventPayloadData, IDiscordSDK } from '@discord/embedded-app-sdk';
 
 const CLIENT_ID = import.meta.env.VITE_DISCORD_CLIENT_ID;
@@ -29,6 +30,15 @@ export const apiPath = (path: string): string => path;
 export function apiSocketUrl(path: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}${apiPath(path)}`;
+}
+
+/** Names the step that failed, so a rejected handshake says which one. */
+async function step<T>(what: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    throw new Error(`${what} failed — ${describeError(error)}`);
+  }
 }
 
 export interface AppUser {
@@ -78,15 +88,19 @@ export async function connect(): Promise<Connection> {
   }
 
   const sdk = new DiscordSDK(CLIENT_ID);
-  await sdk.ready();
+  await step('Connecting to Discord', () => sdk.ready());
 
-  const { code } = await sdk.commands.authorize({
-    client_id: CLIENT_ID,
-    response_type: 'code',
-    state: '',
-    prompt: 'none',
-    scope: ['identify', 'guilds'],
-  });
+  // The usual first-run failure: a new application has no OAuth2 redirect and no URL mapping,
+  // and the portal refuses to issue a code until both exist.
+  const { code } = await step('Authorizing', () =>
+    sdk.commands.authorize({
+      client_id: CLIENT_ID,
+      response_type: 'code',
+      state: '',
+      prompt: 'none',
+      scope: ['identify', 'guilds'],
+    }),
+  );
 
   const response = await fetch(apiPath('/api/token'), {
     method: 'POST',
@@ -98,7 +112,7 @@ export async function connect(): Promise<Connection> {
   }
   const { access_token: accessToken, session, user } = (await response.json()) as TokenResponse;
 
-  await sdk.commands.authenticate({ access_token: accessToken });
+  await step('Authenticating', () => sdk.commands.authenticate({ access_token: accessToken }));
 
   return {
     sdk,

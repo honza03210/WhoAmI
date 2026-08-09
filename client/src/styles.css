@@ -11,7 +11,34 @@
   --team-a: #e05252;
   --team-b: #5271e0;
 
+  /* The activity runs edge to edge, so nothing may assume the top of the frame is visible.
+     index.html sets viewport-fit=cover, which is what makes these resolve at all. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+
   color-scheme: dark;
+}
+
+/*
+ * A floor under the real insets, because a nested browsing context often reports them as zero
+ * even when the frame genuinely does run beneath the status bar — which is how the header ends
+ * up behind an iPhone's Dynamic Island. Overshooting costs a strip of padding; undershooting
+ * hides the controls, so this errs upward. Portrait only: in landscape the island is off to one
+ * side, not overhead.
+ */
+@media (pointer: coarse) and (orientation: portrait) {
+  :root {
+    --safe-top: max(env(safe-area-inset-top, 0px), 48px);
+  }
+}
+
+@media (pointer: coarse) and (orientation: landscape) {
+  :root {
+    --safe-left: max(env(safe-area-inset-left, 0px), 20px);
+    --safe-right: max(env(safe-area-inset-right, 0px), 20px);
+  }
 }
 
 * {
@@ -25,12 +52,23 @@ body {
   font-family: 'gg sans', 'Noto Sans', system-ui, -apple-system, sans-serif;
   font-size: 15px;
   line-height: 1.45;
+  /* Landscape rotation on iOS otherwise inflates text; nothing here needs resizing. */
+  -webkit-text-size-adjust: 100%;
+  /* A stray wide child should never turn the whole board into a sideways scroll. */
+  overflow-x: hidden;
+}
+
+/* Taps should feel like buttons, not like selecting text. */
+button {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 main {
   max-width: 720px;
   margin: 0 auto;
-  padding: 16px 16px 48px;
+  padding: calc(var(--safe-top) + 16px) calc(var(--safe-right) + 16px) calc(var(--safe-bottom) + 48px)
+    calc(var(--safe-left) + 16px);
 }
 
 main.centered {
@@ -78,6 +116,12 @@ section + section {
   gap: 7px;
   color: var(--muted);
   font-size: 13px;
+  /* A long display name must give way rather than push Leave off the edge. */
+  min-width: 0;
+  max-width: 45vw;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .who img {
@@ -193,8 +237,9 @@ code {
 }
 
 .upload-progress progress {
-  flex-shrink: 0;
-  width: 160px;
+  flex: 1;
+  min-width: 0;
+  max-width: 200px;
   accent-color: var(--accent);
 }
 
@@ -460,6 +505,26 @@ code {
   color: #fff;
 }
 
+.setup-hint {
+  margin-top: 14px;
+  max-width: 52ch;
+  text-align: left;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.setup-hint summary {
+  cursor: pointer;
+  text-align: center;
+}
+
+.setup-hint ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
 .notice {
   background: rgba(242, 63, 66, 0.12);
   border-radius: 6px;
@@ -624,6 +689,8 @@ code {
   border-radius: 6px;
   padding: 9px 12px;
   font: inherit;
+  /* Anything under 16px makes iOS Safari zoom the page in on focus and never zoom back out. */
+  font-size: 16px;
 }
 
 .ask input:focus {
@@ -770,4 +837,111 @@ code {
 
 .tile.is-marked:disabled:hover {
   border-color: var(--accent);
+}
+
+/* Touch and small screens */
+
+/*
+ * Hover styling is a lie on a touch screen — it sticks after a tap until something else is
+ * touched — so the pointer-driven states are switched off rather than left to misfire.
+ */
+@media (hover: none) {
+  .chip:hover,
+  .tile:hover,
+  .board.is-guessing .tile:hover,
+  .chip.is-leave:hover,
+  .button.is-guess:hover:not(:disabled) {
+    background: inherit;
+    border-color: transparent;
+    color: inherit;
+  }
+
+  .chip.is-active,
+  .tile.is-marked {
+    border-color: var(--accent);
+  }
+
+  .link-button:hover:not(:disabled) {
+    text-decoration: none;
+    color: var(--muted);
+  }
+}
+
+/* Fingers are not cursors: everything tappable gets to roughly a 44px target. */
+@media (pointer: coarse) {
+  .chip {
+    padding: 12px 16px;
+  }
+
+  .button {
+    padding: 13px 18px;
+  }
+
+  .link-button {
+    padding: 12px 0;
+  }
+
+  .answer-buttons .button {
+    flex: 1;
+    padding: 15px 18px;
+  }
+
+  .hand-over {
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 480px) {
+  /* The avatar still says who you are; the name is what pushes Leave onto a second row. */
+  .who-name {
+    display: none;
+  }
+
+  /* Reasons you can't start belong under the button, not crushed into the space beside it. */
+  .blockers {
+    flex-basis: 100%;
+    margin-top: 4px;
+  }
+
+  /* The question box takes a row to itself. Left to compete with Pass and Guess it collapses to
+     a few characters wide, which is worse than any amount of stacking. */
+  .ask {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+
+  /* Direct children only: the Ask button lives inside .ask and must not stretch to match it. */
+  .actions > .button,
+  .confirm-actions .button {
+    flex: 1;
+  }
+}
+
+@media (max-width: 420px) {
+  main {
+    padding-left: calc(var(--safe-left) + 12px);
+    padding-right: calc(var(--safe-right) + 12px);
+  }
+
+  header {
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  section + section {
+    margin-top: 20px;
+  }
+
+  .board {
+    gap: 6px;
+  }
+
+  .secret img {
+    width: 72px;
+    height: 72px;
+  }
+
+  .start-row .button {
+    flex: 1;
+  }
 }

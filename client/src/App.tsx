@@ -3,6 +3,7 @@ import type { ClientMessage, RoomView } from '../../server/protocol';
 import { CUSTOM_PACK_ID } from '../../server/protocol';
 import type { Connection } from './discord';
 import { connect, isEmbedded, leaveActivity } from './discord';
+import { describeError } from './errors';
 import type { PackManifest, PackSummary } from './packs';
 import { loadPack, loadPackIndex, manifestFromCustomPack } from './packs';
 import type { ConnectionStatus, RoomClient } from './net';
@@ -46,7 +47,7 @@ export function App() {
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) });
+        setStatus({ phase: 'error', message: describeError(error) });
       });
 
     return () => {
@@ -120,6 +121,23 @@ export function App() {
       <main className="centered">
         <h1>Couldn&apos;t start</h1>
         <p className="error">{status.message}</p>
+        {/* Three per-application settings that do not carry over when you switch Discord apps,
+            and cannot be checked from here — the portal exposes no API for any of them. */}
+        <details className="setup-hint">
+          <summary>Check the Discord application settings</summary>
+          <ul>
+            <li>
+              <strong>Activities → URL Mappings</strong>: root <code>/</code> mapped to the host serving this
+              app
+            </li>
+            <li>
+              <strong>Activities → Settings</strong>: activities enabled
+            </li>
+            <li>
+              <strong>OAuth2 → Redirects</strong>: at least one entry, e.g. <code>https://127.0.0.1</code>
+            </li>
+          </ul>
+        </details>
       </main>
     );
   }
@@ -147,7 +165,8 @@ export function App() {
         <span className="spacer" />
         <span className="who">
           <img src={user.avatarUrl} alt="" width={24} height={24} />
-          {user.displayName}
+          {/* Dropped on narrow screens so Leave stays on the same line as everything else. */}
+          <span className="who-name">{user.displayName}</span>
         </span>
         <button type="button" className="chip is-leave" onClick={leave}>
           Leave

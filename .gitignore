@@ -11,3 +11,7 @@ public/packs/
 
 .DS_Store
 *.log
+
+# Editor scratch files
+*.sw[a-p]
+*~
