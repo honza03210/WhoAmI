@@ -7,15 +7,22 @@
     "node": ">=22"
   },
   "scripts": {
+    "setup": "tsx scripts/setup.ts",
+    "doctor": "tsx scripts/doctor.ts",
     "dev": "concurrently -n worker,client -c magenta,cyan \"npm:dev:worker\" \"npm:dev:client\"",
     "dev:client": "vite",
     "dev:worker": "wrangler dev",
+    "dev:discord": "tsx scripts/dev.ts",
     "tunnel": "cloudflared tunnel --url http://localhost:5173",
     "build": "npm run packs && vite build",
     "deploy": "npm run build && wrangler deploy",
     "packs": "tsx scripts/build-packs.ts",
     "demo-pack": "tsx scripts/make-demo-pack.ts",
-    "typecheck": "tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.scripts.json --noEmit"
+    "typecheck": "tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "tsx scripts/e2e.ts",
+    "check": "npm run typecheck && npm run test && npm run test:e2e"
   },
   "dependencies": {
     "@discord/embedded-app-sdk": "^2.1.0",
@@ -33,6 +40,7 @@
     "tsx": "^4.23.11",
     "typescript": "^5.7.3",
     "vite": "^6.0.7",
+    "vitest": "^4.1.10",
     "wrangler": "^4.120.0"
   }
 }

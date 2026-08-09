@@ -49,42 +49,45 @@ Full details — naming rules, `pack.json` overrides, what the encoder does — 
    redirects, but the portal requires an entry before it will issue tokens).
 4. **Activities** → **Settings** → enable activities for the app.
 
-### 2. Configure local secrets
+### 2. Configure
 
 ```bash
-cp .env.example .env          # VITE_DISCORD_CLIENT_ID — public, baked into the client bundle
+npm run setup
 ```
 
-Then put the client ID into `wrangler.jsonc` under `vars.DISCORD_CLIENT_ID`, and the secret into
-`.dev.vars`:
+Prompts for the client ID and secret, then writes `.env`, writes `.dev.vars` with a freshly
+generated `SESSION_SECRET`, sets `vars.DISCORD_CLIENT_ID` in `wrangler.jsonc`, and calls Discord
+to confirm the credentials actually work — a mistyped secret otherwise shows up much later as an
+opaque 502 from `/api/token`.
 
-```
-DISCORD_CLIENT_SECRET=<from the OAuth2 page>
-SESSION_SECRET=<already generated for you; openssl rand -base64 32 to replace>
-```
-
-Both `.env` and `.dev.vars` are gitignored. The client secret must never reach the client bundle —
-only the Worker touches it.
+Non-interactive: `npm run setup -- --client-id X --client-secret Y`. Re-running is safe; existing
+values are kept unless you pass new ones. Both `.env` and `.dev.vars` are gitignored, and the
+client secret only ever reaches the Worker.
 
 ### 3. Start everything
 
-Three processes. In separate terminals, or `npm run dev` for the first two:
-
 ```bash
-npm run dev:worker    # Worker + /api on :8787
-npm run dev:client    # Vite on :5173, proxies /api to the Worker
-npm run tunnel        # cloudflared, prints a https://<random>.trycloudflare.com URL
+npm run dev:discord
 ```
+
+Starts the Worker, Vite, and a cloudflared tunnel, waits for all three, then prints the tunnel
+hostname and what to do with it. Ctrl-C stops all three.
 
 ### 4. Point Discord at the tunnel
 
 Developer portal → **Activities** → **URL Mappings** → set the **root mapping** `/` to the
-`trycloudflare.com` hostname (no scheme, no trailing slash).
+hostname the previous step printed (no scheme, no trailing slash).
 
-This is the mapping that makes everything else work: with `/` mapped, the activity is served from
-`https://<client_id>.discordsays.com` and same-origin paths like `/api/token` and
-`/packs/foo.webp` pass straight through. No `/.proxy` prefix is needed — see
-[Networking](#networking-notes).
+**This is the one step that cannot be automated.** Discord exposes no API for URL mappings —
+`PATCH /applications/@me` has no such field — so it has to be done in the portal by hand.
+
+Quick-tunnel hostnames change every run. To set the mapping once and stop thinking about it, run
+`npm run deploy` and point the root mapping at the stable `guessfi.<subdomain>.workers.dev` host
+instead.
+
+With `/` mapped, the activity is served from `https://<client_id>.discordsays.com` and
+same-origin paths like `/api/token` and `/packs/foo.webp` pass straight through. No `/.proxy`
+prefix is needed — see [Networking](#networking-notes).
 
 ### 5. Launch it
 
@@ -119,8 +122,37 @@ scripts/make-demo-pack.ts    generates the placeholder pack
 wrangler.jsonc               Worker + static asset config
 ```
 
+## Commands
+
+| Command | What it does |
+|---|---|
+| `npm run setup` | Write config, generate `SESSION_SECRET`, verify credentials with Discord |
+| `npm run doctor` | Diagnose anything misconfigured, with the fix for each |
+| `npm run dev:discord` | Worker + Vite + tunnel, and print the URL mapping to paste |
+| `npm run dev` | Worker + Vite only (no tunnel) |
+| `npm run demo-pack` | Generate 24 placeholder portraits |
+| `npm run packs` | Encode `packs/` into `public/packs/` |
+| `npm run build` | Packs, then the client bundle |
+| `npm run deploy` | Build and push to Cloudflare |
+| `npm test` | Unit tests |
+| `npm run test:e2e` | Build, boot the Worker, drive the board in headless Chrome |
+| `npm run check` | Typecheck + unit + e2e — what CI runs |
+
 `npm run typecheck` checks all three projects — client, Worker, and build scripts each have their
 own tsconfig so DOM, Workers, and Node globals never leak into each other.
+
+### What's automated, and what isn't
+
+Everything except the URL mapping. `setup` handles config and proves the credentials work,
+`doctor` explains anything broken, `dev:discord` runs the stack and extracts the tunnel hostname,
+and `check` runs the whole verification suite the same way CI does.
+
+The e2e suite drives Chrome over the DevTools Protocol directly — no Puppeteer or Playwright to
+install — and asserts the things unit tests can't reach: asset routing, `/.proxy` handling, SPA
+fallback, and that the board renders and responds to clicks.
+
+The URL mapping stays manual because Discord provides no API for it. Deploying once and mapping
+to the stable `workers.dev` host reduces that to a single lifetime step.
 
 ## Networking notes
 

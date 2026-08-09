@@ -18,6 +18,7 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
+import { displayNameFromFile, uniqueId } from './lib/naming';
 
 const SOURCE_ROOT = 'packs';
 const OUTPUT_ROOT = path.join('public', 'packs');
@@ -58,23 +59,6 @@ interface IndexEntry {
   name: string;
   tileCount: number;
   cover: string;
-}
-
-function slugify(value: string): string {
-  // Strip combining diacritics so "Tomáš" slugs to "tomas" rather than losing the letter.
-  const ascii = value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-  return ascii.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'character';
-}
-
-/**
- * "01_bob smith.jpg" -> "bob smith". Underscores become spaces and a leading ordering prefix
- * is dropped, so photos can be sequenced by filename. Hyphens are left alone so names like
- * "Anne-Marie" survive; use `names` in pack.json for anything this gets wrong.
- */
-function displayNameFromFile(fileName: string): string {
-  const base = path.basename(fileName, path.extname(fileName));
-  const withoutOrderPrefix = base.replace(/^\d+\s*[-_.]?\s*/, '');
-  return (withoutOrderPrefix || base).replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 async function readPackConfig(sourceDir: string): Promise<PackConfig> {
@@ -133,14 +117,7 @@ async function buildPack(packId: string, force: boolean): Promise<IndexEntry | n
 
   for (const fileName of imageFiles) {
     const name = config.names?.[fileName] ?? displayNameFromFile(fileName);
-
-    let id = slugify(name);
-    if (usedIds.has(id)) {
-      let suffix = 2;
-      while (usedIds.has(`${id}-${suffix}`)) suffix++;
-      id = `${id}-${suffix}`;
-    }
-    usedIds.add(id);
+    const id = uniqueId(name, usedIds);
 
     const tile = `${id}.webp`;
     const full = `${id}@full.webp`;
