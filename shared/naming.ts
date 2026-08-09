@@ -1,4 +1,10 @@
-import path from 'node:path';
+/**
+ * Turning photo filenames into character names and ids.
+ *
+ * Shared rather than living under scripts/, because photos now arrive two ways — from `packs/`
+ * at build time and from a file picker in the browser — and both have to produce the same ids.
+ * Deliberately free of `node:path` so it can be bundled into the client.
+ */
 
 /** Turns a display name into a filesystem- and URL-safe character id. */
 export function slugify(value: string): string {
@@ -13,7 +19,10 @@ export function slugify(value: string): string {
  * "Anne-Marie" survive; use `names` in pack.json for anything this gets wrong.
  */
 export function displayNameFromFile(fileName: string): string {
-  const base = path.basename(fileName, path.extname(fileName));
+  // Directory components are dropped: a browser directory pick reports "folder/name.jpg".
+  const leaf = fileName.slice(fileName.lastIndexOf('/') + 1);
+  // A leading dot is part of the name, not an extension — ".jpg" is a file called ".jpg".
+  const base = leaf.replace(/(?!^)\.[^.]*$/, '');
   const withoutOrderPrefix = base.replace(/^\d+\s*[-_.]?\s*/, '');
   return (withoutOrderPrefix || base).replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
 }

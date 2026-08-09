@@ -1,9 +1,14 @@
-import { useEffect, useState } from 'react';
-import type { AppUser, Connection } from './discord';
-import { connect, getParticipants, isEmbedded, onParticipantsChange } from './discord';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ClientMessage, RoomView } from '../../server/protocol';
+import { CUSTOM_PACK_ID } from '../../server/protocol';
+import type { Connection } from './discord';
+import { connect, isEmbedded } from './discord';
 import type { PackManifest, PackSummary } from './packs';
-import { loadPack, loadPackIndex } from './packs';
-import { Board } from './screens/Board';
+import { loadPack, loadPackIndex, manifestFromCustomPack } from './packs';
+import type { ConnectionStatus, RoomClient } from './net';
+import { connectRoom } from './net';
+import { Game } from './screens/Game';
+import { Lobby } from './screens/Lobby';
 
 type Status =
   | { phase: 'connecting' }
@@ -12,21 +17,31 @@ type Status =
 
 export function App() {
   const [status, setStatus] = useState<Status>({ phase: 'connecting' });
-  const [participants, setParticipants] = useState<AppUser[]>([]);
-  const [packs, setPacks] = useState<PackSummary[] | null>(null);
+  const [packs, setPacks] = useState<PackSummary[]>([]);
   const [pack, setPack] = useState<PackManifest | null>(null);
-  const [packError, setPackError] = useState<string | null>(null);
+  const [view, setView] = useState<RoomView | null>(null);
+  const [connection, setConnection] = useState<ConnectionStatus>('connecting');
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const room = useRef<RoomClient | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let unsubscribe: (() => void) | undefined;
 
     connect()
-      .then(async (connection) => {
+      .then((established) => {
         if (cancelled) return;
-        setStatus({ phase: 'ready', connection });
-        setParticipants(await getParticipants(connection.sdk));
-        unsubscribe = onParticipantsChange(connection.sdk, setParticipants);
+        setStatus({ phase: 'ready', connection: established });
+
+        if (!established.session) {
+          setConnection('closed');
+          return;
+        }
+        room.current = connectRoom(established.session, established.instanceId, {
+          onState: setView,
+          onStatus: setConnection,
+          onError: (error) => setNotice(error.message),
+        });
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -35,46 +50,59 @@ export function App() {
 
     return () => {
       cancelled = true;
-      unsubscribe?.();
+      room.current?.close();
+      room.current = null;
     };
   }, []);
 
-  // Packs are static assets, so they load independently of the Discord handshake.
   useEffect(() => {
     let cancelled = false;
-    loadPackIndex()
-      .then((index) => {
-        if (cancelled) return;
-        setPacks(index);
-        return index[0] ? selectPack(index[0].id) : undefined;
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setPackError(error instanceof Error ? error.message : String(error));
-      });
-
-    async function selectPack(packId: string) {
-      const manifest = await loadPack(packId);
-      if (!cancelled) setPack(manifest);
-    }
-
+    loadPackIndex().then(
+      (index) => !cancelled && setPacks(index),
+      () => undefined,
+    );
     return () => {
       cancelled = true;
     };
   }, []);
 
-  async function choosePack(packId: string) {
-    setPackError(null);
-    try {
-      setPack(await loadPack(packId));
-    } catch (error: unknown) {
-      setPackError(error instanceof Error ? error.message : String(error));
-    }
-  }
+  // The room decides which pack is in play; the client just loads whatever it names.
+  useEffect(() => {
+    const packId = view?.packId;
+    // An uploaded board needs no fetch: its character list arrives with the room state.
+    if (!packId || packId === CUSTOM_PACK_ID || packId === pack?.id) return;
+
+    let cancelled = false;
+    loadPack(packId).then(
+      (manifest) => !cancelled && setPack(manifest),
+      (error: unknown) => !cancelled && setNotice(error instanceof Error ? error.message : String(error)),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [view?.packId, pack?.id]);
+
+  const customPack = view?.packId === CUSTOM_PACK_ID ? (view.customPack ?? null) : null;
+  const instanceId = status.phase === 'ready' ? status.connection.instanceId : null;
+  const customManifest = useMemo(
+    () => (customPack && instanceId ? manifestFromCustomPack(customPack, instanceId) : null),
+    // Keyed on the token rather than the object: room state is re-parsed every frame, so the
+    // pack is a new object each time, but its token changes only when the photos do.
+    [customPack?.token, instanceId], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  // Errors are transient: a rejected click shouldn't leave a banner up forever.
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  const send = useCallback((message: ClientMessage) => room.current?.send(message), []);
 
   if (status.phase === 'connecting') {
     return <main className="centered">Connecting to Discord…</main>;
   }
-
   if (status.phase === 'error') {
     return (
       <main className="centered">
@@ -84,13 +112,14 @@ export function App() {
     );
   }
 
-  const { user } = status.connection;
+  const { user, session } = status.connection;
 
   return (
     <main>
       <header>
         <h1>guessFi</h1>
-        {!isEmbedded && <span className="badge">standalone dev — not running inside Discord</span>}
+        {!isEmbedded && <span className="badge">standalone</span>}
+        <ConnectionPill status={connection} hasSession={session !== null} />
         <span className="spacer" />
         <span className="who">
           <img src={user.avatarUrl} alt="" width={24} height={24} />
@@ -98,50 +127,39 @@ export function App() {
         </span>
       </header>
 
-      {packs !== null && packs.length > 1 && (
-        <nav className="pack-switcher">
-          {packs.map((summary) => (
-            <button
-              type="button"
-              key={summary.id}
-              className={summary.id === pack?.id ? 'chip is-active' : 'chip'}
-              onClick={() => void choosePack(summary.id)}
-            >
-              {summary.name}
-            </button>
-          ))}
-        </nav>
-      )}
+      {notice && <p className="error notice">{notice}</p>}
 
-      {packError && <p className="error">{packError}</p>}
-
-      {pack ? (
-        <Board pack={pack} />
-      ) : packs !== null && packs.length === 0 ? (
+      {!session ? (
         <section className="empty">
-          <h2>No photo packs yet</h2>
+          <h2>No game session</h2>
           <p>
-            Drop photos into <code>packs/&lt;pack-name&gt;/</code> and run <code>npm run packs</code>.
-            To try it with placeholders first, run <code>npm run demo-pack</code>.
+            Running outside Discord without dev sessions enabled. Set{' '}
+            <code>ALLOW_DEV_SESSIONS=true</code> in <code>.dev.vars</code> and restart the Worker, or
+            open the activity inside Discord.
           </p>
         </section>
+      ) : !view ? (
+        <p className="muted">Joining the room…</p>
+      ) : view.phase === 'lobby' ? (
+        <Lobby
+          view={view}
+          packs={packs}
+          send={send}
+          session={session}
+          instanceId={status.connection.instanceId}
+          onNotice={setNotice}
+        />
       ) : (
-        !packError && <p className="muted">Loading pack…</p>
+        <Game view={view} pack={customManifest ?? pack} send={send} />
       )}
-
-      <section>
-        <h2>In this activity ({participants.length})</h2>
-        <ul className="people">
-          {participants.map((person) => (
-            <li key={person.id}>
-              <div className="person">
-                <img src={person.avatarUrl} alt="" width={32} height={32} />
-                <span>{person.displayName}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </section>
     </main>
   );
+}
+
+function ConnectionPill({ status, hasSession }: { status: ConnectionStatus; hasSession: boolean }) {
+  if (!hasSession) return null;
+  if (status === 'open') return null;
+  const label =
+    status === 'connecting' ? 'connecting…' : status === 'reconnecting' ? 'reconnecting…' : 'disconnected';
+  return <span className={status === 'closed' ? 'badge is-bad' : 'badge'}>{label}</span>;
 }

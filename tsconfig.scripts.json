@@ -19,5 +19,5 @@
     "verbatimModuleSyntax": true,
     "noEmit": true
   },
-  "include": ["scripts"]
+  "include": ["scripts", "shared"]
 }

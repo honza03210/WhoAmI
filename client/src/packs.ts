@@ -1,3 +1,5 @@
+import type { CustomPack } from '../../server/protocol';
+import { CUSTOM_PACK_ID } from '../../server/protocol';
 import { apiPath } from './discord';
 
 export interface PackCharacter {
@@ -14,6 +16,12 @@ export interface PackManifest {
   name: string;
   tileCount: number;
   characters: PackCharacter[];
+  /**
+   * Where this pack's images live. Built-in packs are static assets under /packs; an uploaded
+   * pack is served by the room, so the two differ in path but not in kind — both are
+   * same-origin, which is what keeps the Discord iframe's CSP out of the picture.
+   */
+  baseUrl: string;
 }
 
 export interface PackSummary {
@@ -23,9 +31,30 @@ export interface PackSummary {
   cover: string;
 }
 
-/** Packs are same-origin static assets, so no CSP handling is needed for these. */
-export function packAsset(packId: string, file: string): string {
-  return apiPath(`/packs/${packId}/${file}`);
+export function packAsset(pack: PackManifest, file: string): string {
+  return `${pack.baseUrl}/${file}`;
+}
+
+/**
+ * The board the host uploaded, as a manifest indistinguishable from a built-in one.
+ *
+ * Derived from room state rather than fetched: the character list already arrives with every
+ * state frame, so there is nothing left to ask the server for.
+ */
+export function manifestFromCustomPack(pack: CustomPack, instanceId: string): PackManifest {
+  return {
+    id: CUSTOM_PACK_ID,
+    name: pack.name,
+    tileCount: pack.characters.length,
+    characters: pack.characters.map((character) => ({
+      id: character.id,
+      name: character.name,
+      tile: `${character.id}.webp`,
+      full: `${character.id}@full.webp`,
+    })),
+    // Photos are addressed by room and by the pack's random token; see handlePack in index.ts.
+    baseUrl: apiPath(`/api/pack/${encodeURIComponent(instanceId)}/${pack.token}`),
+  };
 }
 
 /**
@@ -49,7 +78,7 @@ export async function loadPackIndex(): Promise<PackSummary[]> {
 }
 
 export async function loadPack(packId: string): Promise<PackManifest> {
-  const manifest = await fetchJson<PackManifest>(`/packs/${packId}/manifest.json`);
+  const manifest = await fetchJson<Omit<PackManifest, 'baseUrl'>>(`/packs/${packId}/manifest.json`);
   if (!manifest) throw new Error(`Pack "${packId}" is missing or invalid. Run: npm run packs`);
-  return manifest;
+  return { ...manifest, baseUrl: apiPath(`/packs/${packId}`) };
 }

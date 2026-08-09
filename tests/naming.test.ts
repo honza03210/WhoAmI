@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { displayNameFromFile, slugify, uniqueId } from '../scripts/lib/naming';
+import { displayNameFromFile, slugify, uniqueId } from '../shared/naming';
 
 describe('displayNameFromFile', () => {
   it('uses the filename as the character name', () => {

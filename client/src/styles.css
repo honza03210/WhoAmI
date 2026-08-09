@@ -8,6 +8,8 @@
   --muted: #949ba4;
   --accent: #5865f2;
   --danger: #f23f42;
+  --team-a: #e05252;
+  --team-b: #5271e0;
 
   color-scheme: dark;
 }
@@ -146,6 +148,43 @@ code {
   color: #fff;
 }
 
+.chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Dashed, because it opens a file picker rather than selecting something that already exists. */
+.chip.is-upload {
+  background: transparent;
+  border: 1px dashed var(--surface-hover);
+  color: var(--muted);
+}
+
+.chip.is-upload:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.pack-hint {
+  font-size: 12px;
+  margin: 0 0 18px;
+  max-width: 60ch;
+}
+
+.upload-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 18px;
+  font-size: 13px;
+}
+
+.upload-progress progress {
+  flex-shrink: 0;
+  width: 160px;
+  accent-color: var(--accent);
+}
+
 /* Board */
 
 .board-header {
@@ -263,4 +302,406 @@ code {
 .person img {
   border-radius: 50%;
   flex-shrink: 0;
+}
+
+/* Lobby */
+
+.teams {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 560px) {
+  .teams {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.team {
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 12px;
+  border-top: 3px solid var(--muted);
+}
+
+.team-a {
+  border-top-color: var(--team-a);
+}
+
+.team-b {
+  border-top-color: var(--team-b);
+}
+
+.team-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.team-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.team .people {
+  gap: 4px;
+}
+
+.team .person {
+  background: rgba(0, 0, 0, 0.22);
+  padding: 5px 10px;
+}
+
+.empty-team {
+  margin: 4px 0 8px;
+  font-size: 13px;
+}
+
+.person-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.person.is-away {
+  opacity: 0.45;
+}
+
+.tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 1px 5px;
+  flex-shrink: 0;
+}
+
+.tag.is-leader {
+  background: var(--accent);
+  color: #fff;
+}
+
+.tick {
+  color: #3ba55d;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.hand-over {
+  font-size: 11px;
+  margin: 2px 0 4px 38px;
+}
+
+.start-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.button {
+  background: var(--surface);
+  color: var(--text);
+  border: none;
+  border-radius: 6px;
+  padding: 9px 16px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.button.is-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.button.is-primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.blockers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.badge.is-bad {
+  background: var(--danger);
+  color: #fff;
+}
+
+.notice {
+  background: rgba(242, 63, 66, 0.12);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 0 0 16px;
+}
+
+.button.is-secondary {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--surface-hover);
+}
+
+/* Ending the game on a guess is irreversible, so it reads as the weightier of the two moves. */
+.button.is-guess {
+  background: transparent;
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--danger);
+}
+
+.button.is-guess:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* Game */
+
+/* Whose move it is has to be readable at a glance from across the room, so this one heading
+   opts out of the small-caps section-label treatment. */
+.turn,
+.result {
+  border-radius: 10px;
+  padding: 12px 16px;
+  border-left: 3px solid var(--muted);
+  background: var(--surface);
+}
+
+.turn h2,
+.result h2 {
+  font-size: 16px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  margin: 0;
+}
+
+.turn-a,
+.result-a {
+  border-left-color: var(--team-a);
+}
+
+.turn-b,
+.result-b {
+  border-left-color: var(--team-b);
+}
+
+.result p {
+  margin: 6px 0 0;
+}
+
+/* The one thing on screen the rest of the team must not read over your shoulder. */
+.secret {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: linear-gradient(180deg, rgba(88, 101, 242, 0.16), rgba(88, 101, 242, 0.05));
+  box-shadow: inset 0 0 0 1px rgba(88, 101, 242, 0.35);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.secret img {
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.secret h2 {
+  font-size: 17px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  margin: 0 0 2px;
+}
+
+.secret p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ask {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  min-width: 260px;
+}
+
+.ask input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--surface-hover);
+  border-radius: 6px;
+  padding: 9px 12px;
+  font: inherit;
+}
+
+.ask input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.asked {
+  flex: 1;
+  min-width: 220px;
+  margin: 0;
+  font-size: 17px;
+}
+
+.answer-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.confirm {
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: inset 0 0 0 1px var(--danger);
+}
+
+.confirm p {
+  margin: 0 0 12px;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Question log */
+
+.log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.log-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 6px 12px;
+  border-left: 3px solid var(--muted);
+}
+
+.log-a {
+  border-left-color: var(--team-a);
+}
+
+.log-b {
+  border-left-color: var(--team-b);
+}
+
+.log-team {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  flex-shrink: 0;
+  width: 4ch;
+}
+
+.log-text {
+  flex: 1;
+}
+
+.log-answer {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.log-answer.is-yes {
+  color: #3ba55d;
+}
+
+.log-answer.is-no {
+  color: var(--danger);
+}
+
+.log-answer.is-open {
+  color: var(--muted);
+}
+
+.board-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 28px;
+}
+
+.board-switcher + section {
+  margin-top: 10px;
+}
+
+/* Guess mode: the board stops being a scratchpad and becomes one irreversible choice. */
+.board.is-guessing .tile:hover {
+  border-color: var(--danger);
+}
+
+.board.is-guessing .tile.is-flipped {
+  opacity: 0.55;
+}
+
+.badge.is-guessing {
+  background: var(--danger);
+  color: #fff;
+}
+
+.tile.is-marked {
+  border-color: var(--accent);
+}
+
+.tile-mark {
+  display: block;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 4px;
+  text-align: center;
+}
+
+.tile:disabled {
+  cursor: default;
+}
+
+.tile:disabled:hover {
+  border-color: transparent;
+}
+
+.tile.is-marked:disabled:hover {
+  border-color: var(--accent);
 }

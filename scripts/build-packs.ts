@@ -18,7 +18,7 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
-import { displayNameFromFile, uniqueId } from './lib/naming';
+import { displayNameFromFile, uniqueId } from '../shared/naming';
 
 const SOURCE_ROOT = 'packs';
 const OUTPUT_ROOT = path.join('public', 'packs');

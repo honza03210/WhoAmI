@@ -8,9 +8,10 @@ roster come from Discord — the app only owns game state.
 
 Runs entirely on Cloudflare's free tier.
 
-**Status: phases 1–2 of 6 complete.** The activity boots inside Discord, authenticates, and renders
-a photo board you can flip tiles on. There is no multiplayer yet — flipping is local state, and
-teams, turns, and secrets arrive in phases 3–4. See [Roadmap](#roadmap).
+**Status: phases 1–4 of 6 complete.** A full game is playable: two teams pick leaders in a shared
+lobby, each leader is dealt a secret character only they can see, and the teams take turns asking
+yes/no questions and ruling faces out until a leader names the opponent's character. What's left is
+polish — layout modes, mobile, spectator UI, disconnect handling. See [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -33,11 +34,31 @@ your own. Good enough for UI work; useless for testing anything involving real i
 
 ## Photo packs
 
-Drop photos into `packs/<pack-name>/` and run `npm run packs`. Filenames become character names.
-Full details — naming rules, `pack.json` overrides, what the encoder does — in
-[`packs/README.md`](packs/README.md).
+Two ways to get faces on the board.
 
-`npm run build` runs the pack build first, so a deploy always ships current packs.
+**Built in, shipped with the app.** Drop photos into `packs/<pack-name>/` and run `npm run packs`.
+Filenames become character names. Full details — naming rules, `pack.json` overrides, what the
+encoder does — in [`packs/README.md`](packs/README.md). `npm run build` runs the pack build first,
+so a deploy always ships current packs.
+
+**Custom, picked at the table.** In the lobby the host can hit **Custom photos…** and choose 10–40
+images from their device. The browser centre-crops and re-encodes each one to the same 256px tile
+and 512px full-size WebP the build script produces, then uploads them to the room. Quality steps
+down until a photo fits the room's per-photo budget, and a photo too dense to fit even at the
+lowest quality is shrunk rather than rejected.
+
+Worth knowing about the custom path:
+
+- **The photos live in the room, not on the asset layer.** Static assets are read-only after a
+  deploy, so uploads go into the Durable Object's own storage. They are deleted when the room is
+  cleaned up — a few hours after everyone leaves — which is the right default for pictures of
+  people's friends.
+- **They are served by a random token**, not by room id, so knowing which voice channel a game was
+  in is not enough to fetch the pictures.
+- **Encoding happens in the browser.** The Worker never sees a full-resolution photo, only the
+  small WebPs it stores, and the resize costs Cloudflare nothing.
+- Only the host can upload, only in the lobby, and publishing a new board clears everyone's ready
+  state — a different board is a different game.
 
 ## Running inside Discord
 
@@ -112,11 +133,22 @@ Then repoint the root URL mapping from the tunnel to `guessfi.<your-subdomain>.w
 
 ```
 client/src/discord.ts        SDK handshake, participant roster, the single place request paths are built
+client/src/net.ts            Room WebSocket, heartbeat and reconnect
 client/src/packs.ts          Pack index/manifest loading
+client/src/customPack.ts     Browser-side resize/encode and upload of the host's own photos
+client/src/screens/Lobby.tsx Teams, leaders, pack choice, ready-up
+client/src/screens/Game.tsx  Turn banner, secret card, question log, guessing, endgame
 client/src/screens/Board.tsx The tile grid
 client/src/App.tsx           UI shell
-server/index.ts              Worker: routing, /api/token OAuth exchange
+server/index.ts              Worker: routing, /api/token OAuth exchange, WS upgrade
+server/room.ts               GameRoom Durable Object: sockets, persistence, fan-out
+server/lobby.ts              Room rules as pure functions; dispatches in-game messages
+server/game.ts               Turn order, leader authority, guess resolution
+server/redact.ts             Per-recipient views — the only path from state to the wire
+server/customPack.ts         Upload draft/commit rules for host-supplied photos
+server/protocol.ts           Wire contract shared by both sides, plus the frame validator
 server/session.ts            HMAC session tokens (Web Crypto)
+shared/naming.ts             Filename -> character name and id, used by the build and the browser
 scripts/build-packs.ts       photos -> square WebP tiles + manifests
 scripts/make-demo-pack.ts    generates the placeholder pack
 wrangler.jsonc               Worker + static asset config
@@ -182,9 +214,9 @@ unparseable JSON as "not built yet" rather than trusting the status code.
 |---|---|---|
 | 1 | Scaffold, Discord handshake, participant list | ✅ done |
 | 2 | Photo pack pipeline and the board grid | ✅ done |
-| 3 | `GameRoom` Durable Object, WebSocket protocol, lobby with teams and leaders | next |
-| 4 | Game loop: secrets, questions, tile flips, guessing, endgame | |
-| 5 | Layout modes, mobile, spectators, reconnect, room cleanup | |
+| 3 | `GameRoom` Durable Object, WebSocket protocol, lobby with teams and leaders | ✅ done |
+| 4 | Game loop: secrets, questions, tile flips, guessing, endgame | ✅ done |
+| 5 | Layout modes, mobile, spectators, reconnect, room cleanup | next |
 | 6 | Deploy and smoke test | |
 
 ### The design constraint that shapes everything

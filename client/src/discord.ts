@@ -1,7 +1,11 @@
 import { DiscordSDK, DiscordSDKMock } from '@discord/embedded-app-sdk';
+import { avatarUrl } from './avatar';
 import type { EventPayloadData, IDiscordSDK } from '@discord/embedded-app-sdk';
 
 const CLIENT_ID = import.meta.env.VITE_DISCORD_CLIENT_ID;
+
+// Re-exported so callers have one obvious place to reach for Discord helpers.
+export { avatarUrl };
 
 /**
  * Discord loads the activity with a `frame_id` query param.
@@ -37,22 +41,16 @@ export interface AppUser {
 export interface Connection {
   sdk: IDiscordSDK;
   user: AppUser;
-  /** HMAC session token minted by our Worker. Null when running standalone. */
+  /** HMAC session token minted by our Worker. Null if the room can't be joined. */
   session: string | null;
+  /** Rooms are keyed by this, so everyone in one voice channel shares a game. */
+  instanceId: string;
 }
 
 interface TokenResponse {
   access_token: string;
   session: string;
   user: { id: string; username: string; displayName: string; avatar: string | null };
-}
-
-/** cdn.discordapp.com is one of the few origins allowed through the activity CSP. */
-export function avatarUrl(id: string, avatar: string | null | undefined): string {
-  if (avatar) return `https://cdn.discordapp.com/avatars/${id}/${avatar}.png?size=128`;
-  // Default avatars for migrated (pomelo) usernames are indexed by (snowflake >> 22) % 6.
-  const index = Number((BigInt(id) >> 22n) % 6n);
-  return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
 }
 
 type RawParticipant = EventPayloadData<'ACTIVITY_INSTANCE_PARTICIPANTS_UPDATE'>['participants'][number];
@@ -105,6 +103,7 @@ export async function connect(): Promise<Connection> {
   return {
     sdk,
     session,
+    instanceId: sdk.instanceId,
     user: {
       id: user.id,
       username: user.username,
@@ -114,8 +113,18 @@ export async function connect(): Promise<Connection> {
   };
 }
 
-/** Fake connection for `npm run dev` in an ordinary browser tab, outside Discord. */
+/**
+ * Fake connection for `npm run dev` in an ordinary browser tab, outside Discord.
+ *
+ * `?user=` and `?instance=` let several tabs act as different people in the same (or different)
+ * rooms, which is how the lobby gets exercised without two real Discord accounts. The session
+ * comes from /api/dev-session, which only exists when ALLOW_DEV_SESSIONS is set in .dev.vars.
+ */
 async function connectStandalone(): Promise<Connection> {
+  const params = new URLSearchParams(window.location.search);
+  const who = params.get('user') ?? 'dev';
+  const instanceId = params.get('instance') ?? 'standalone-room';
+
   const sdk = new DiscordSDKMock(CLIENT_ID || 'standalone-dev', 'mock-guild-id', 'mock-channel-id', null);
 
   const fake = (id: string, username: string): RawParticipant => ({
@@ -136,13 +145,23 @@ async function connectStandalone(): Promise<Connection> {
 
   await sdk.ready();
 
+  // 404 here just means dev sessions are switched off; the UI still renders, minus the room.
+  let session: string | null = null;
+  try {
+    const response = await fetch(apiPath(`/api/dev-session?name=${encodeURIComponent(who)}`));
+    if (response.ok) session = ((await response.json()) as { session: string }).session;
+  } catch {
+    // No Worker running — standalone still shows the board.
+  }
+
   return {
     sdk,
-    session: null,
+    session,
+    instanceId,
     user: {
-      id: '100000000000000001',
-      username: 'you',
-      displayName: 'You (standalone)',
+      id: `dev-${who}`,
+      username: who,
+      displayName: `${who} (standalone)`,
       avatarUrl: avatarUrl('100000000000000001', null),
     },
   };

@@ -20,5 +20,7 @@
     "verbatimModuleSyntax": true,
     "noEmit": true
   },
-  "include": ["client/src", "vite.config.ts"]
+  // server/protocol.ts is the shared wire contract, imported by both sides so they can't drift;
+  // shared/ holds logic the client and the build scripts must agree on, like character naming.
+  "include": ["client/src", "server/protocol.ts", "shared", "vite.config.ts"]
 }

@@ -11,9 +11,16 @@ const decoder = new TextDecoder();
 
 const DEFAULT_TTL_SECONDS = 6 * 60 * 60;
 
-export interface SessionClaims {
+export interface SessionProfile {
   /** Discord user id, as resolved from GET /users/@me. */
   uid: string;
+  /** Display name, carried in the token so the room never has to trust the client for it. */
+  name: string;
+  /** Discord avatar hash, or null for the default avatar. */
+  avatar: string | null;
+}
+
+export interface SessionClaims extends SessionProfile {
   /** Unix seconds. */
   exp: number;
 }
@@ -41,10 +48,10 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
 
 export async function createSession(
   secret: string,
-  uid: string,
+  profile: SessionProfile,
   ttlSeconds: number = DEFAULT_TTL_SECONDS,
 ): Promise<string> {
-  const claims: SessionClaims = { uid, exp: Math.floor(Date.now() / 1000) + ttlSeconds };
+  const claims: SessionClaims = { ...profile, exp: Math.floor(Date.now() / 1000) + ttlSeconds };
   const payload = toBase64Url(encoder.encode(JSON.stringify(claims)));
   const signature = await crypto.subtle.sign('HMAC', await hmacKey(secret), encoder.encode(payload));
   return `${payload}.${toBase64Url(new Uint8Array(signature))}`;
@@ -72,6 +79,8 @@ export async function verifySession(secret: string, token: string): Promise<Sess
   try {
     const claims = JSON.parse(decoder.decode(fromBase64Url(payload))) as SessionClaims;
     if (typeof claims.uid !== 'string' || typeof claims.exp !== 'number') return null;
+    if (typeof claims.name !== 'string') return null;
+    if (claims.avatar !== null && typeof claims.avatar !== 'string') return null;
     if (claims.exp < Date.now() / 1000) return null;
     return claims;
   } catch {

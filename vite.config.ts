@@ -14,6 +14,8 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // The client imports server/protocol.ts, which sits outside the Vite root.
+    fs: { allow: ['..'] },
     // cloudflared hands out a random *.trycloudflare.com hostname; without this Vite
     // rejects it as an unrecognised Host header and the activity shows a blank frame.
     allowedHosts: true,

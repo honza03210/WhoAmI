@@ -1,64 +1,62 @@
-import { useCallback, useMemo, useState } from 'react';
 import type { PackManifest } from '../packs';
 import { packAsset } from '../packs';
 
+export type BoardMode = 'flip' | 'guess' | 'locked';
+
 interface BoardProps {
   pack: PackManifest;
+  /** Ruled-out characters. Owned by the room, so every teammate sees the same board. */
+  flipped: ReadonlySet<string>;
+  /** Badges keyed by character id — the leader's own secret, and both reveals at the end. */
+  marks?: Readonly<Record<string, string>>;
+  mode: BoardMode;
+  onPick?: (characterId: string) => void;
+  onReset?: () => void;
 }
 
 /**
  * The board grid.
  *
- * Flipping is local component state for now. In phase 4 it moves to the Durable Object and
- * becomes per-team private state — the opposing team must never see which tiles you've ruled
- * out — so treat this as a preview of the mechanic rather than its final home.
+ * Deliberately knows nothing about teams, turns or secrets: it renders the flip set it is handed
+ * and reports clicks. Which tiles that set contains is decided by the Durable Object and filtered
+ * per recipient in redact.ts, because a board that revealed the opponent's deductions would give
+ * the game away.
  */
-export function Board({ pack }: BoardProps) {
-  const [flipped, setFlipped] = useState<ReadonlySet<string>>(() => new Set());
-
-  const toggle = useCallback((characterId: string) => {
-    setFlipped((previous) => {
-      const next = new Set(previous);
-      if (!next.delete(characterId)) next.add(characterId);
-      return next;
-    });
-  }, []);
-
-  const reset = useCallback(() => setFlipped(new Set()), []);
-
-  const remaining = useMemo(() => pack.tileCount - flipped.size, [pack.tileCount, flipped.size]);
+export function Board({ pack, flipped, marks, mode, onPick, onReset }: BoardProps) {
+  const standing = pack.tileCount - flipped.size;
 
   return (
     <section>
       <div className="board-header">
         <h2>
-          {pack.name} — {remaining} of {pack.tileCount} standing
+          {pack.name} — {standing} of {pack.tileCount} standing
         </h2>
-        <button type="button" className="link-button" onClick={reset} disabled={flipped.size === 0}>
-          Reset
-        </button>
+        {mode === 'guess' && <span className="badge is-guessing">Pick who they are</span>}
+        {onReset && (
+          <button type="button" className="link-button" onClick={onReset} disabled={flipped.size === 0}>
+            Reset
+          </button>
+        )}
       </div>
 
-      <ul className="board">
+      <ul className={mode === 'guess' ? 'board is-guessing' : 'board'}>
         {pack.characters.map((character) => {
           const isFlipped = flipped.has(character.id);
+          const mark = marks?.[character.id];
+
           return (
             <li key={character.id}>
               <button
                 type="button"
-                className={isFlipped ? 'tile is-flipped' : 'tile'}
-                onClick={() => toggle(character.id)}
-                aria-pressed={isFlipped}
-                aria-label={isFlipped ? `${character.name}, ruled out` : character.name}
+                className={tileClass(isFlipped, mark !== undefined)}
+                onClick={() => onPick?.(character.id)}
+                disabled={mode === 'locked'}
+                aria-pressed={mode === 'flip' ? isFlipped : undefined}
+                aria-label={tileLabel(character.name, isFlipped, mode, mark)}
               >
-                <img
-                  src={packAsset(pack.id, character.tile)}
-                  alt=""
-                  loading="lazy"
-                  width={256}
-                  height={256}
-                />
+                <img src={packAsset(pack, character.tile)} alt="" loading="lazy" width={256} height={256} />
                 <span className="tile-name">{character.name}</span>
+                {mark && <span className="tile-mark">{mark}</span>}
               </button>
             </li>
           );
@@ -66,4 +64,16 @@ export function Board({ pack }: BoardProps) {
       </ul>
     </section>
   );
+}
+
+function tileClass(isFlipped: boolean, isMarked: boolean): string {
+  return ['tile', isFlipped && 'is-flipped', isMarked && 'is-marked'].filter(Boolean).join(' ');
+}
+
+function tileLabel(name: string, isFlipped: boolean, mode: BoardMode, mark: string | undefined): string {
+  if (mode === 'guess') return `Guess ${name}`;
+  const parts = [name];
+  if (mark) parts.push(mark);
+  if (isFlipped) parts.push('ruled out');
+  return parts.join(', ');
 }

@@ -12,6 +12,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -145,7 +146,30 @@ function findChrome(): string | null {
   return null;
 }
 
-/** Minimal CDP client over the WebSocket built into Node 22. */
+/**
+ * Minimal CDP client over the WebSocket built into Node 22.
+ *
+ * Opens a blank target and navigates via Page.navigate rather than passing the URL to
+ * /json/new, whose query string can't unambiguously carry a URL that has its own parameters.
+ */
+async function openPage(pageUrl: string) {
+  const page = await connectCdp('about:blank');
+  await page.call('Page.enable', {});
+  await page.call('Page.navigate', { url: pageUrl });
+
+  const origin = new URL(pageUrl).origin;
+  // The first execution context may still be about:blank, and is torn down when the real
+  // navigation commits, so wait until the page is genuinely ours and loaded.
+  await waitFor(
+    `${pageUrl} to load`,
+    async () =>
+      (await page.evaluate<boolean>(
+        `location.origin === ${JSON.stringify(origin)} && document.readyState === 'complete'`,
+      )) === true,
+  );
+  return page;
+}
+
 async function connectCdp(pageUrl: string) {
   const target = (await (
     await get(`http://127.0.0.1:${DEBUG_PORT}/json/new?${pageUrl}`, { method: 'PUT' })
@@ -167,19 +191,18 @@ async function connectCdp(pageUrl: string) {
     socket.onerror = () => reject(new Error('CDP socket failed'));
   });
 
+  const call = (method: string, params: Record<string, unknown>): Promise<{ result?: unknown }> => {
+    const id = ++nextId;
+    return new Promise((resolve) => {
+      pending.set(id, resolve);
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+  };
+
   return {
+    call,
     async evaluate<T>(expression: string): Promise<T> {
-      const id = ++nextId;
-      const reply = await new Promise<{ result?: unknown }>((resolve) => {
-        pending.set(id, resolve);
-        socket.send(
-          JSON.stringify({
-            id,
-            method: 'Runtime.evaluate',
-            params: { expression, awaitPromise: true, returnByValue: true },
-          }),
-        );
-      });
+      const reply = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
       const result = reply.result as
         | { exceptionDetails?: { text?: string; exception?: { description?: string } }; result?: { value?: T } }
         | undefined;
@@ -217,14 +240,19 @@ const BOARD_SCRIPT = `(async () => {
   const wait = async (test, ms = 15000) => {
     const end = Date.now() + ms;
     while (Date.now() < end) { if (test()) return true; await new Promise(r => setTimeout(r, 50)); }
-    throw new Error('timed out waiting for board to render');
+    // Report what the page actually shows: a blank body means the app threw, whereas
+    // "Loading the board…" means the pack fetch is the problem.
+    throw new Error('timed out — page reads: ' + JSON.stringify(document.body.innerText.slice(0, 400)));
   };
   await wait(() => document.querySelectorAll('.tile').length > 0);
   const tiles = () => [...document.querySelectorAll('.tile')];
   const heading = () => document.querySelector('.board-header h2').textContent.trim();
   const flipped = () => document.querySelectorAll('.tile.is-flipped').length;
-  const resetBtn = () => document.querySelector('.link-button');
-  const settle = () => new Promise(r => setTimeout(r, 120));
+  // Scoped to the board: the in-game actions above it carry link buttons of their own.
+  const resetBtn = () => document.querySelector('.board-header .link-button');
+  // Flips round-trip through the Durable Object now, so wait for the room to agree rather
+  // than sleeping and hoping.
+  const settle = (n) => wait(() => flipped() === n, 5000);
 
   const out = {
     tileCount: tiles().length,
@@ -235,29 +263,754 @@ const BOARD_SCRIPT = `(async () => {
   };
 
   tiles()[0].click(); tiles()[5].click(); tiles()[11].click();
-  await settle();
+  await settle(3);
   out.afterThreeFlips = heading();
   out.flippedCount = flipped();
   out.ariaPressed = tiles()[0].getAttribute('aria-pressed');
   out.ariaLabel = tiles()[0].getAttribute('aria-label');
 
   tiles()[5].click();
-  await settle();
+  await settle(2);
   out.afterUnflip = heading();
   out.flippedAfterUnflip = flipped();
 
   resetBtn().click();
-  await settle();
+  await settle(0);
   out.afterReset = heading();
   out.flippedAfterReset = flipped();
   out.resetDisabledAfterReset = resetBtn().disabled;
 
-  // Images are lazy-loaded; scroll to the bottom so they all start, then wait for them.
-  window.scrollTo(0, document.body.scrollHeight);
+  // Tiles are lazy-loaded, and with the game UI above the board most of them never come near
+  // the viewport in a headless window. Opt them out rather than trying to scroll past each one:
+  // the point of this check is that all 24 assets resolve, not when the browser asks for them.
+  for (const img of document.querySelectorAll('.tile img')) img.loading = 'eager';
   await wait(() => [...document.querySelectorAll('.tile img')].every(i => i.complete), 20000);
   out.brokenImages = [...document.querySelectorAll('.tile img')].filter(i => i.naturalWidth === 0).length;
   return out;
 })()`;
+
+/**
+ * Exercises the Durable Object directly over WebSockets, with no browser in the way.
+ *
+ * The browser test proves the UI wiring; this proves the room's rules and, crucially, that
+ * rejections are enforced server-side rather than merely hidden by a disabled button.
+ */
+async function connectClient(instance: string, name: string) {
+  const { session } = (await (await get(`${BASE_URL}/api/dev-session?name=${name}`)).json()) as {
+    session: string;
+  };
+  const socket = new WebSocket(`ws://127.0.0.1:${SERVER_PORT}/api/ws?instance=${instance}&session=${session}`);
+  const states: RoomStateLike[] = [];
+  const errors: { code: string }[] = [];
+  // Kept verbatim: the redaction checks assert on the bytes, not on a parsed view that might
+  // quietly drop a field the server actually sent.
+  const frames: string[] = [];
+
+  socket.onmessage = (event) => {
+    const raw = String(event.data);
+    frames.push(raw);
+    const message = JSON.parse(raw) as { type: 'state'; state: RoomStateLike } | { type: 'error'; code: string };
+    if (message.type === 'state') states.push(message.state);
+    if (message.type === 'error') errors.push({ code: message.code });
+  };
+  await new Promise<void>((resolve, reject) => {
+    socket.onopen = () => resolve();
+    socket.onerror = () => reject(new Error(`${name} could not open a socket`));
+  });
+
+  return {
+    name,
+    frames,
+    send: (message: unknown) => socket.send(JSON.stringify(message)),
+    close: () => socket.close(),
+    latest: () => states[states.length - 1],
+    until: async (predicate: (state: RoomStateLike) => boolean, ms = 5_000) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        const state = states[states.length - 1];
+        if (state && predicate(state)) return state;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error(`${name}: state never satisfied the predicate`);
+    },
+    nextError: async (ms = 2_000) => {
+      const before = errors.length;
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        if (errors.length > before) return errors[errors.length - 1];
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return null;
+    },
+  };
+}
+
+type RoomClientLike = Awaited<ReturnType<typeof connectClient>>;
+
+async function checkRoomProtocol(): Promise<void> {
+  const instance = `e2e-proto-${Date.now()}`;
+  const connect = (name: string) => connectClient(instance, name);
+
+  checkEqual('unauthenticated upgrade refused', (await get(`${BASE_URL}/api/ws?instance=x`)).status, 426);
+
+  const alice = await connect('alice');
+  await alice.until((state) => state.members.length === 1);
+  checkEqual('first joiner is host', alice.latest()?.hostId, 'dev-alice');
+
+  const bob = await connect('bob');
+  await Promise.all([alice.until((s) => s.members.length === 2), bob.until((s) => s.members.length === 2)]);
+  check('both clients see both members', true);
+
+  alice.send({ type: 'setTeam', team: 'a' });
+  await bob.until((state) => state.leaders.a === 'dev-alice');
+  check('team change and leadership propagate', true);
+
+  bob.send({ type: 'selectPack', packId: 'demo' });
+  checkEqual('non-host pack change rejected by the server', (await bob.nextError())?.code, 'not_host');
+
+  bob.send({ type: 'setTeam', team: 'b' });
+  alice.send({ type: 'selectPack', packId: 'demo' });
+  await bob.until((state) => state.packId === 'demo');
+
+  alice.send({ type: 'startGame' });
+  checkEqual('start refused while players are unready', (await alice.nextError())?.code, 'not_ready');
+
+  alice.send({ type: 'setReady', ready: true });
+  bob.send({ type: 'setReady', ready: true });
+  await alice.until((state) => state.startBlockers.length === 0);
+
+  bob.send({ type: 'startGame' });
+  checkEqual('non-host start rejected by the server', (await bob.nextError())?.code, 'not_host');
+
+  alice.send({ type: 'startGame' });
+  await bob.until((state) => state.phase === 'in_progress');
+  check('game start reaches every client', true);
+
+  bob.send('not json at all');
+  checkEqual('malformed frame rejected', (await bob.nextError())?.code, 'bad_message');
+  checkEqual('room survives a malformed frame', alice.latest()?.phase, 'in_progress');
+
+  // Mid-game departures are remembered so the player can come back to their team.
+  bob.close();
+  await alice.until((state) => state.members.find((m) => m.userId === 'dev-bob')?.connected === false);
+  checkEqual('a departed player is kept mid-game', alice.latest()?.members.length, 2);
+
+  const bobAgain = await connect('bob');
+  const restored = await bobAgain.until((state) => state.you.userId === 'dev-bob' && state.you.team === 'b');
+  checkEqual('reconnect restores the team', restored.you.team, 'b');
+  checkEqual('reconnect restores leadership', restored.leaders.b, 'dev-bob');
+  checkEqual(
+    'reconnect does not duplicate the player',
+    restored.members.filter((m) => m.userId === 'dev-bob').length,
+    1,
+  );
+
+  alice.close();
+  bobAgain.close();
+}
+
+interface RoomStateLike {
+  phase: string;
+  hostId: string | null;
+  packId: string | null;
+  leaders: { a: string | null; b: string | null };
+  members: { userId: string; team: string | null; connected: boolean; ready: boolean }[];
+  startBlockers: string[];
+  you: { userId: string; team: string | null; isHost: boolean; isLeader: boolean };
+  customPack: { token: string; name: string; characters: { id: string; name: string }[] } | null;
+  game: {
+    activeTeam: string;
+    stage: string;
+    flipped: Record<string, string[]>;
+    yourSecret: string | null;
+    reveal: Record<string, string> | null;
+    log: { id: number; askedBy: string; text: string; answer: string | null }[];
+    outcome: { winner: string; reason: string; guess: { characterId: string } } | null;
+  } | null;
+}
+
+/**
+ * Plays a whole game over WebSockets: deal, question, answer, turn swap, flips, guess, reveal,
+ * rematch — plus the checks that matter most, which are about what each client is *not* sent.
+ *
+ * Four people, because the leaks only become visible with more than one player per team: a
+ * teammate must not see their own leader's secret, and the opposing team must see neither the
+ * secret nor which faces have been ruled out.
+ */
+async function checkGameProtocol(packId: string, characterIds: string[]): Promise<void> {
+  const instance = `e2e-game-${Date.now()}`;
+  const connect = (name: string) => connectClient(instance, name);
+
+  const alice = await connect('alice'); // Red leader, and host
+  const carol = await connect('carol'); // Red, not leader
+  const bob = await connect('bob'); // Blue leader
+  const erin = await connect('erin'); // Blue, not leader
+  const dave = await connect('dave'); // spectator
+
+  const everyone = [alice, carol, bob, erin, dave];
+  await alice.until((state) => state.members.length === 5);
+
+  alice.send({ type: 'setTeam', team: 'a' });
+  carol.send({ type: 'setTeam', team: 'a' });
+  bob.send({ type: 'setTeam', team: 'b' });
+  erin.send({ type: 'setTeam', team: 'b' });
+  await alice.until((state) => state.leaders.a === 'dev-alice' && state.leaders.b === 'dev-bob');
+
+  alice.send({ type: 'selectPack', packId });
+  for (const player of [alice, carol, bob, erin]) player.send({ type: 'setReady', ready: true });
+  await alice.until((state) => state.startBlockers.length === 0);
+
+  alice.send({ type: 'startGame' });
+  for (const client of everyone) await client.until((state) => state.phase === 'in_progress');
+  check('a spectator does not block the start', true);
+
+  const redSecret = alice.latest()?.game?.yourSecret;
+  const blueSecret = bob.latest()?.game?.yourSecret;
+  check('Red’s leader is told their character', typeof redSecret === 'string', redSecret);
+  check('Blue’s leader is told their character', typeof blueSecret === 'string', blueSecret);
+  check('the dealt characters are on the board', characterIds.includes(redSecret ?? ''), redSecret);
+  checkEqual('a teammate is not told the secret', carol.latest()?.game?.yourSecret, null);
+  checkEqual('a spectator is not told either secret', dave.latest()?.game?.yourSecret, null);
+  checkEqual('nothing is revealed while the game runs', alice.latest()?.game?.reveal, null);
+
+  checkEqual('a player is sent only their own board', Object.keys(alice.latest()?.game?.flipped ?? {}), ['a']);
+  checkEqual('a spectator is sent both boards', Object.keys(dave.latest()?.game?.flipped ?? {}).sort(), ['a', 'b']);
+
+  // Turn order.
+  checkEqual('Red opens', alice.latest()?.game?.activeTeam, 'a');
+  carol.send({ type: 'askQuestion', text: 'Am I allowed to ask?' });
+  checkEqual('a non-leader cannot ask', (await carol.nextError())?.code, 'not_leader');
+  bob.send({ type: 'askQuestion', text: 'Can I ask out of turn?' });
+  checkEqual('the waiting team cannot ask', (await bob.nextError())?.code, 'not_your_turn');
+
+  alice.send({ type: 'askQuestion', text: 'Do they wear glasses?' });
+  await bob.until((state) => state.game?.stage === 'answering');
+  checkEqual('the question reaches the other team', bob.latest()?.game?.log[0]?.text, 'Do they wear glasses?');
+  checkEqual('the question log is public to spectators', dave.latest()?.game?.log.length, 1);
+
+  alice.send({ type: 'answerQuestion', answer: 'yes' });
+  checkEqual('you cannot answer your own question', (await alice.nextError())?.code, 'not_your_question');
+  carol.send({ type: 'answerQuestion', answer: 'yes' });
+  checkEqual('the asking team cannot answer itself', (await carol.nextError())?.code, 'not_your_question');
+  erin.send({ type: 'answerQuestion', answer: 'yes' });
+  checkEqual('a non-leader cannot answer', (await erin.nextError())?.code, 'not_leader');
+
+  bob.send({ type: 'answerQuestion', answer: 'no' });
+  await alice.until((state) => state.game?.activeTeam === 'b');
+  checkEqual('the answer is logged', alice.latest()?.game?.log[0]?.answer, 'no');
+  checkEqual('answering passes the turn', alice.latest()?.game?.stage, 'asking');
+
+  // Flips are shared within a team and invisible outside it. Pick faces that are nobody's
+  // secret, so a leak can't be mistaken for a legitimately revealed character.
+  const spare = characterIds.filter((id) => id !== redSecret && id !== blueSecret);
+  const [redFlip, blueFlip] = [spare[0] ?? '', spare[1] ?? ''];
+
+  carol.send({ type: 'flipTile', characterId: redFlip, down: true });
+  await alice.until((state) => (state.game?.flipped['a'] ?? []).includes(redFlip));
+  check('a teammate’s flip reaches the rest of the team', true);
+
+  bob.send({ type: 'flipTile', characterId: blueFlip, down: true });
+  await dave.until((state) => (state.game?.flipped['b'] ?? []).includes(blueFlip));
+  checkEqual('the opposing team is not sent that flip', alice.latest()?.game?.flipped['b'], undefined);
+
+  bob.send({ type: 'flipTile', characterId: 'not-a-real-character', down: true });
+  checkEqual('a flip of an unknown character is refused', (await bob.nextError())?.code, 'no_such_character');
+
+  // How much each client had received before the reveal. Everything after it legitimately
+  // contains both secrets and both boards, so the leak checks must stop here.
+  const framesBeforeReveal = Object.fromEntries(everyone.map((client) => [client.name, client.frames.length]));
+
+  // Blue is on turn and guesses wrong, which hands the game to Red.
+  const wrongGuess = characterIds.find((id) => id !== redSecret) ?? '';
+  bob.send({ type: 'submitGuess', characterId: wrongGuess });
+  for (const client of everyone) await client.until((state) => state.phase === 'endgame');
+
+  checkEqual('a wrong guess gives the game to the other team', alice.latest()?.game?.outcome?.winner, 'a');
+  checkEqual('the outcome says why', alice.latest()?.game?.outcome?.reason, 'wrong_guess');
+  for (const client of everyone) {
+    checkEqual(`${client.name} sees both characters revealed`, client.latest()?.game?.reveal, {
+      a: redSecret,
+      b: blueSecret,
+    });
+  }
+
+  // The check this whole design exists for. Ids are matched quoted, so "sam" can't be reported
+  // as leaked because the frame happened to contain "sam-2".
+  const leaked = (client: RoomClientLike, id: string | null | undefined) =>
+    client.frames
+      .slice(0, framesBeforeReveal[client.name] ?? 0)
+      .some((frame) => frame.includes(`"${id ?? '(none)'}"`));
+
+  check('Red’s secret never reached the opposing leader before the reveal', !leaked(bob, redSecret));
+  check('Red’s secret never reached Red’s own non-leader', !leaked(carol, redSecret));
+  check('Blue’s secret never reached Blue’s own non-leader', !leaked(erin, blueSecret));
+  check(
+    'neither secret ever reached a spectator before the reveal',
+    !leaked(dave, redSecret) && !leaked(dave, blueSecret),
+  );
+  check('Red’s ruled-out tiles never reached the opposing team', !leaked(bob, redFlip) && !leaked(erin, redFlip));
+  check('Blue’s ruled-out tiles never reached Red', !leaked(alice, blueFlip) && !leaked(carol, blueFlip));
+
+  alice.send({ type: 'askQuestion', text: 'One more?' });
+  checkEqual('a finished game accepts no more moves', (await alice.nextError())?.code, 'game_over');
+
+  bob.send({ type: 'rematch' });
+  checkEqual('only the host can call a rematch', (await bob.nextError())?.code, 'not_host');
+
+  alice.send({ type: 'rematch' });
+  await carol.until((state) => state.phase === 'lobby');
+  checkEqual('a rematch keeps the teams', carol.latest()?.members.find((m) => m.userId === 'dev-carol')?.team, 'a');
+  checkEqual('a rematch keeps the leaders', carol.latest()?.leaders.b, 'dev-bob');
+  checkEqual('a rematch clears the game', carol.latest()?.game, null);
+  check(
+    'a rematch clears readiness',
+    (carol.latest()?.members ?? []).every((member) => !member.ready),
+  );
+
+  for (const client of everyone) client.close();
+}
+
+interface LobbyReport {
+  aliceSeesMembers: number;
+  bobSeesMembers: number;
+  bobSeesAliceOnRed: boolean;
+  aliceLeadsRed: boolean;
+  aliceSeesBobOnBlue: boolean;
+  bobSeesPack: boolean;
+  startDisabledBeforeReady: boolean;
+  bobHasNoStart: boolean;
+  startEnabledAfterReady: boolean;
+  bobLeftLobby: boolean;
+}
+
+/** Helpers injected into each page: find controls by their visible text. */
+const PAGE_HELPERS = `
+  const wait = async (test, ms = 10000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { const v = test(); if (v) return v; await new Promise(r => setTimeout(r, 50)); }
+    throw new Error('timed out: ' + test.toString().slice(0, 120));
+  };
+  const byText = (selector, text, root = document) =>
+    [...root.querySelectorAll(selector)].find(el => el.textContent.trim() === text);
+  const teamPanel = (team) => document.querySelector('.team-' + team);
+  const namesIn = (team) => [...(teamPanel(team)?.querySelectorAll('.person-name') ?? [])].map(el => el.textContent);
+  const memberCount = () => document.querySelectorAll('.person').length;
+`;
+
+async function runLobbyFlow(
+  alice: Awaited<ReturnType<typeof openPage>>,
+  bob: Awaited<ReturnType<typeof openPage>>,
+): Promise<LobbyReport> {
+  const evalOn = <T,>(page: typeof alice, body: string) =>
+    page.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  // Both must reach the lobby before anything is clicked.
+  await evalOn<boolean>(alice, `await wait(() => document.querySelector('.teams')); return true;`);
+  await evalOn<boolean>(bob, `await wait(() => document.querySelector('.teams')); return true;`);
+
+  const report = {} as LobbyReport;
+  report.aliceSeesMembers = await evalOn<number>(alice, `await wait(() => memberCount() === 2); return memberCount();`);
+  report.bobSeesMembers = await evalOn<number>(bob, `await wait(() => memberCount() === 2); return memberCount();`);
+
+  // alice joins Red...
+  await evalOn<boolean>(alice, `byText('button', 'Join', teamPanel('a')).click(); return true;`);
+  // ...and bob's screen must show it without a reload.
+  report.bobSeesAliceOnRed = await evalOn<boolean>(
+    bob,
+    `await wait(() => namesIn('a').some(n => n.includes('alice'))); return true;`,
+  );
+  report.aliceLeadsRed = await evalOn<boolean>(
+    alice,
+    `await wait(() => teamPanel('a').querySelector('.tag.is-leader')); return true;`,
+  );
+
+  await evalOn<boolean>(bob, `byText('button', 'Join', teamPanel('b')).click(); return true;`);
+  report.aliceSeesBobOnBlue = await evalOn<boolean>(
+    alice,
+    `await wait(() => namesIn('b').some(n => n.includes('bob'))); return true;`,
+  );
+
+  // Only the host sees pack chips; bob should just be told which pack was picked.
+  await evalOn<boolean>(alice, `await wait(() => document.querySelector('.pack-switcher .chip')).then(c => c.click()); return true;`);
+  report.bobSeesPack = await evalOn<boolean>(
+    bob,
+    `await wait(() => /chosen by the host/.test(document.body.textContent)); return true;`,
+  );
+
+  report.bobHasNoStart = await evalOn<boolean>(bob, `return !byText('button', 'Start game');`);
+  report.startDisabledBeforeReady = await evalOn<boolean>(
+    alice,
+    `await wait(() => byText('button', 'Start game')); return byText('button', 'Start game').disabled;`,
+  );
+
+  await evalOn<boolean>(alice, `byText('button', "I'm ready").click(); return true;`);
+  await evalOn<boolean>(bob, `await wait(() => byText('button', "I'm ready")).then(b => b.click()); return true;`);
+
+  report.startEnabledAfterReady = await evalOn<boolean>(
+    alice,
+    `await wait(() => !byText('button', 'Start game').disabled); return true;`,
+  );
+
+  await evalOn<boolean>(alice, `byText('button', 'Start game').click(); return true;`);
+  report.bobLeftLobby = await evalOn<boolean>(
+    bob,
+    `await wait(() => !document.querySelector('.teams')); return true;`,
+  );
+
+  // The board only exists once the game is running.
+  await evalOn<boolean>(alice, `await wait(() => document.querySelectorAll('.tile').length > 0); return true;`);
+  return report;
+}
+
+/**
+ * Uploads a board of generated photos the way the browser does, then plays with it.
+ *
+ * Custom packs are the one path where the room stores bytes rather than reading them off the
+ * asset layer, so this covers what unit tests can't reach: that the Worker routes the upload to
+ * the right room, that the photos come back over HTTP, and that a game can actually be dealt
+ * from a board that exists only in Durable Object storage.
+ */
+async function checkCustomPack(): Promise<void> {
+  const sharp = (await import('sharp')).default;
+  const instance = `e2e-custom-${Date.now()}`;
+
+  const sessionFor = async (name: string) =>
+    ((await (await get(`${BASE_URL}/api/dev-session?name=${name}`)).json()) as { session: string }).session;
+
+  const alice = await connectClient(instance, 'alice'); // host
+  const bob = await connectClient(instance, 'bob');
+  await alice.until((state) => state.members.length === 2);
+
+  const [aliceSession, bobSession] = [await sessionFor('alice'), await sessionFor('bob')];
+  const base = `${BASE_URL}/api/pack/${instance}`;
+  const post = (url: string, init: RequestInit = {}) => get(url, { method: 'POST', ...init });
+
+  const refused = await post(`${base}/begin?session=${bobSession}`, { body: '{}' });
+  checkEqual('a non-host cannot start an upload', refused.status, 403);
+
+  const begun = await post(`${base}/begin?session=${aliceSession}`, { body: JSON.stringify({ name: 'Party' }) });
+  checkEqual('the host can start an upload', begun.status, 200);
+  const { token } = (await begun.json()) as { token: string };
+  check('the upload gets an unguessable token', /^[0-9a-f]{32}$/.test(token), token);
+
+  // Ten distinct 8x8 WebPs — enough to be a legal board, small enough to be instant.
+  const names = ['Ada', 'Bram', 'Cleo', 'Dev', 'Elif', 'Fionn', 'Greta', 'Hugo', 'Ines', 'Jonas'];
+  const photos = await Promise.all(
+    names.map((_, index) =>
+      sharp({
+        create: { width: 8, height: 8, channels: 3, background: { r: index * 20, g: 80, b: 200 - index * 15 } },
+      })
+        .webp()
+        .toBuffer(),
+    ),
+  );
+
+  const characters = names.map((name) => ({ id: name.toLowerCase(), name }));
+
+  const tooBig = await post(`${base}/${token}/add?file=huge.webp&session=${aliceSession}`, {
+    body: Buffer.alloc(200 * 1024),
+    headers: { 'content-type': 'image/webp' },
+  });
+  checkEqual('an oversized photo is refused', tooBig.status, 413);
+
+  const traversal = await post(`${base}/${token}/add?file=../room&session=${aliceSession}`, {
+    body: photos[0] as Buffer,
+    headers: { 'content-type': 'image/webp' },
+  });
+  checkEqual('a photo cannot be written outside its pack', traversal.status, 400);
+
+  let uploaded = 0;
+  for (const [index, character] of characters.entries()) {
+    for (const file of [`${character.id}.webp`, `${character.id}%40full.webp`]) {
+      const response = await post(`${base}/${token}/add?file=${file}&session=${aliceSession}`, {
+        body: photos[index] as Buffer,
+        headers: { 'content-type': 'image/webp' },
+      });
+      if (response.ok) uploaded++;
+    }
+  }
+  checkEqual('every photo uploads', uploaded, characters.length * 2);
+
+  const short = await post(`${base}/${token}/commit?session=${aliceSession}`, {
+    body: JSON.stringify({ characters: characters.slice(0, 3) }),
+  });
+  checkEqual('a board below the minimum is refused', short.status, 400);
+
+  const committed = await post(`${base}/${token}/commit?session=${aliceSession}`, {
+    body: JSON.stringify({ characters }),
+  });
+  checkEqual('the board commits', committed.status, 200);
+
+  // Committing publishes the board itself — no selectPack needed.
+  const published = await bob.until((state) => state.packId === 'custom');
+  checkEqual('the uploaded board reaches everyone', published.customPack?.characters.length, characters.length);
+  checkEqual('the board keeps its name', published.customPack?.name, 'Party');
+  checkEqual('filenames become character names', published.customPack?.characters[0]?.name, 'Ada');
+
+  const photo = await get(`${base}/${token}/ada.webp`);
+  checkEqual('a photo is served back', photo.status, 200);
+  checkEqual('a photo is served as webp', photo.headers.get('content-type'), 'image/webp');
+  check('a photo is cached hard', (photo.headers.get('cache-control') ?? '').includes('immutable'));
+
+  const wrongToken = await get(`${base}/${'0'.repeat(32)}/ada.webp`);
+  checkEqual('photos are not reachable without the token', wrongToken.status, 404);
+  checkEqual('an unknown photo 404s', (await get(`${base}/${token}/nobody.webp`)).status, 404);
+
+  // A board that exists only in room storage still deals a game.
+  alice.send({ type: 'setTeam', team: 'a' });
+  bob.send({ type: 'setTeam', team: 'b' });
+  alice.send({ type: 'setReady', ready: true });
+  bob.send({ type: 'setReady', ready: true });
+  await alice.until((state) => state.startBlockers.length === 0);
+
+  alice.send({ type: 'startGame' });
+  await alice.until((state) => state.phase === 'in_progress');
+  const secret = alice.latest()?.game?.yourSecret ?? '';
+  check(
+    'the game is dealt from the uploaded board',
+    characters.some((character) => character.id === secret),
+    secret,
+  );
+
+  alice.close();
+  bob.close();
+}
+
+interface GameUiReport {
+  aliceSeesSecret: boolean;
+  bobSeesDifferentSecret: boolean;
+  aliceSecretIsHers: boolean;
+  bobWaitsForRed: boolean;
+  bobGetsTheQuestion: boolean;
+  aliceSeesAnswer: string;
+  turnPassedToBlue: boolean;
+  aliceHasNoAskBox: boolean;
+  confirmAppears: boolean;
+  aliceSeesResult: string;
+  bobSeesResult: string;
+  bothRevealed: boolean;
+  rematchReturnsToLobby: boolean;
+}
+
+/**
+ * A whole game through the UI: Red asks, Blue answers, the turn passes, Blue names a character
+ * and the room lands on a result both players can see.
+ *
+ * The rules already have unit and over-the-wire coverage; what this adds is that the screens are
+ * actually wired to them — a leader who can't find the Ask box has the same effect as a broken
+ * state machine.
+ */
+async function runGameFlow(
+  alice: Awaited<ReturnType<typeof openPage>>,
+  bob: Awaited<ReturnType<typeof openPage>>,
+): Promise<GameUiReport> {
+  const evalOn = <T,>(page: typeof alice, body: string) =>
+    page.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${GAME_HELPERS} ${body} })()`);
+
+  const report = {} as GameUiReport;
+
+  // Each leader is shown one character, and it is not the other's.
+  const aliceSecret = await evalOn<string>(alice, `await wait(() => secretName()); return secretName();`);
+  const bobSecret = await evalOn<string>(bob, `await wait(() => secretName()); return secretName();`);
+  report.aliceSeesSecret = Boolean(aliceSecret);
+  report.bobSeesDifferentSecret = Boolean(bobSecret) && bobSecret !== aliceSecret;
+  // The badge on the board must agree with the card, or a leader is hunting the wrong face.
+  report.aliceSecretIsHers = await evalOn<boolean>(
+    alice,
+    `const marked = [...document.querySelectorAll('.tile.is-marked .tile-name')].map(n => n.textContent);
+     return marked.length === 1 && marked[0] === secretName();`,
+  );
+
+  report.bobWaitsForRed = await evalOn<boolean>(bob, `return !document.querySelector('.ask input');`);
+
+  await evalOn<boolean>(
+    alice,
+    `const box = await wait(() => document.querySelector('.ask input'));
+     setValue(box, 'Do they wear glasses?');
+     byText('button', 'Ask').click();
+     return true;`,
+  );
+
+  report.bobGetsTheQuestion = await evalOn<boolean>(
+    bob,
+    `await wait(() => document.querySelector('.answer-buttons'));
+     return /Do they wear glasses\\?/.test(document.body.textContent);`,
+  );
+
+  await evalOn<boolean>(bob, `byText('.answer-buttons button', 'Yes').click(); return true;`);
+
+  report.aliceSeesAnswer = await evalOn<string>(
+    alice,
+    `const el = await wait(() => document.querySelector('.log-answer.is-yes')); return el.textContent.trim();`,
+  );
+  report.turnPassedToBlue = await evalOn<boolean>(
+    bob,
+    `await wait(() => document.querySelector('.ask input')); return true;`,
+  );
+  report.aliceHasNoAskBox = await evalOn<boolean>(alice, `return !document.querySelector('.ask input');`);
+
+  // Blue names a character. Whether it happens to be right doesn't matter — either way the
+  // game ends and both screens must land on the same result.
+  await evalOn<boolean>(bob, `byText('.actions button', 'Guess their character').click(); return true;`);
+  report.confirmAppears = await evalOn<boolean>(
+    bob,
+    `await wait(() => document.querySelector('.board.is-guessing'));
+     document.querySelectorAll('.tile')[3].click();
+     await wait(() => document.querySelector('.confirm'));
+     return true;`,
+  );
+  await evalOn<boolean>(bob, `byText('.confirm button', "Yes, that's them").click(); return true;`);
+
+  report.bobSeesResult = await evalOn<string>(
+    bob,
+    `const el = await wait(() => document.querySelector('.result h2')); return el.textContent.trim();`,
+  );
+  report.aliceSeesResult = await evalOn<string>(
+    alice,
+    `const el = await wait(() => document.querySelector('.result h2')); return el.textContent.trim();`,
+  );
+  // Both characters are named on the board once there is nothing left to protect. Checked by
+  // label rather than by counting tiles: both teams can be dealt the same face, which marks one
+  // tile for two teams.
+  report.bothRevealed = await evalOn<boolean>(
+    bob,
+    `await wait(() => {
+       const labels = [...document.querySelectorAll('.tile.is-marked .tile-mark')].map(el => el.textContent).join(' ');
+       return labels.includes('Red') && labels.includes('Blue');
+     });
+     return true;`,
+  );
+
+  await evalOn<boolean>(alice, `byText('button', 'Back to the lobby').click(); return true;`);
+  report.rematchReturnsToLobby = await evalOn<boolean>(
+    bob,
+    `await wait(() => document.querySelector('.teams')); return true;`,
+  );
+
+  return report;
+}
+
+/**
+ * Writes photos for the picker to pick.
+ *
+ * JPEGs at an awkward non-square size, so the client's centre-crop and re-encode have real work
+ * to do. Half of them are gaussian noise: that is the worst case any lossy encoder can be handed,
+ * and it is what forces the quality-and-downscale ladder in customPack.ts to actually run. A flat
+ * colour would compress to nothing and prove only that the happy path works.
+ */
+async function writeTestPhotos(directory: string, names: string[]): Promise<string[]> {
+  const sharp = (await import('sharp')).default;
+
+  return Promise.all(
+    names.map(async (name, index) => {
+      const file = path.join(directory, `${name}.jpg`);
+      const noise = { type: 'gaussian' as const, mean: 128, sigma: 90 };
+      const black = { r: 0, g: 0, b: 0 };
+
+      // The first photo is noise at the tile's own resolution, so the crop is roughly 1:1 and
+      // none of the grain averages away on the way down — the case that actually needs the
+      // quality-and-downscale ladder. Larger noise sources soften as they shrink.
+      const create =
+        index === 0
+          ? { width: 520, height: 512, channels: 3 as const, background: black, noise }
+          : index % 2 === 0
+            ? { width: 900, height: 600, channels: 3 as const, background: black, noise }
+            : {
+                width: 900,
+                height: 600,
+                channels: 3 as const,
+                background: { r: 30 + index * 20, g: 120, b: 220 - index * 18 },
+              };
+
+      await sharp({ create }).jpeg({ quality: 100 }).toFile(file);
+      return file;
+    }),
+  );
+}
+
+interface CustomUiReport {
+  chipCount: number;
+  packName: string;
+  tileNames: string[];
+  brokenImages: number;
+  largestPhotoBytes: number;
+}
+
+/**
+ * Drives the host's file picker with real photos on disk.
+ *
+ * This is the only coverage of client/src/customPack.ts — the resize-and-encode path that turns
+ * a picked JPEG into the WebP the room stores. The HTTP-level test uploads bytes that sharp
+ * produced, which proves the room but not the browser half; here Chrome does the encoding, so a
+ * broken canvas step or a wrong file name shows up as a board that never appears.
+ */
+async function runCustomPackUpload(
+  page: Awaited<ReturnType<typeof openPage>>,
+  other: Awaited<ReturnType<typeof openPage>>,
+  files: string[],
+): Promise<CustomUiReport> {
+  const evalOn = <T,>(body: string) => page.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  await page.call('DOM.enable', {});
+  const document = (await page.call('DOM.getDocument', { depth: 0 })).result as { root: { nodeId: number } };
+  const input = (await page.call('DOM.querySelector', {
+    nodeId: document.root.nodeId,
+    selector: 'input[type="file"]',
+  })).result as { nodeId: number };
+  if (!input?.nodeId) throw new Error('no file input on the page — is the host seeing the pack picker?');
+
+  await page.call('DOM.setFileInputFiles', { nodeId: input.nodeId, files });
+
+  // Encoding forty photos would be slow; ten is quick, but still give it room on a cold CI box.
+  await evalOn<boolean>(
+    `await wait(() => document.querySelector('.chip.is-active')?.textContent?.includes('${files.length}'), 60000);
+     return true;`,
+  );
+
+  // Publishing a new board clears everyone's readiness, so both players confirm again.
+  await other.evaluate<boolean>(
+    `(async () => { ${PAGE_HELPERS} await wait(() => byText('button', "I'm ready")).then(b => b.click()); return true; })()`,
+  );
+
+  return evalOn<CustomUiReport>(
+    `const active = document.querySelector('.chip.is-active');
+     // The board only renders once the game starts, so read the picker and then start one.
+     const report = {
+       chipCount: document.querySelectorAll('.pack-switcher .chip').length,
+       packName: active.textContent.trim(),
+     };
+     byText('button', "I'm ready").click();
+     await wait(() => !byText('button', 'Start game').disabled);
+     byText('button', 'Start game').click();
+     await wait(() => document.querySelectorAll('.tile').length > 0, 20000);
+     report.tileNames = [...document.querySelectorAll('.tile-name')].map(el => el.textContent);
+     for (const img of document.querySelectorAll('.tile img')) img.loading = 'eager';
+     await wait(() => [...document.querySelectorAll('.tile img')].every(i => i.complete), 20000);
+     report.brokenImages = [...document.querySelectorAll('.tile img')].filter(i => i.naturalWidth === 0).length;
+     // Includes the leader's secret card, which is the 512px encode — the one most likely to
+     // have needed the quality-and-downscale ladder.
+     const urls = [...new Set([
+       ...document.querySelectorAll('.tile img'),
+       ...document.querySelectorAll('.secret img'),
+     ].map(img => img.src))];
+     const sizes = await Promise.all(urls.map(async url => (await (await fetch(url)).blob()).size));
+     report.largestPhotoBytes = Math.max(...sizes);
+     return report;`,
+  );
+}
+
+const GAME_HELPERS = `
+  const secretName = () => {
+    const heading = document.querySelector('.secret h2');
+    const match = heading && heading.textContent.match(/^Your team is (.+)$/);
+    return match ? match[1].trim() : null;
+  };
+  // React tracks the input's value internally, so a plain assignment is ignored on submit.
+  const setValue = (input, value) => {
+    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+`;
 
 async function main(): Promise<void> {
   const chrome = findChrome();
@@ -275,6 +1028,7 @@ async function main(): Promise<void> {
   }
 
   const profileDir = await mkdtemp(path.join(tmpdir(), 'guessfi-e2e-'));
+  const photosDir = await mkdtemp(path.join(tmpdir(), 'guessfi-photos-'));
   let server: ChildProcess | undefined;
   let browser: ChildProcess | undefined;
 
@@ -283,6 +1037,7 @@ async function main(): Promise<void> {
     // deleting the directory.
     await Promise.all([stopGracefully(browser), stopGracefully(server)]);
     await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+    await rm(photosDir, { recursive: true, force: true }).catch(() => {});
 
     // The port being free is the real proof nothing was orphaned.
     const released = await waitFor(
@@ -315,7 +1070,17 @@ async function main(): Promise<void> {
     // group, so signalling the group we spawned would miss wrangler and orphan workerd.
     server = spawnGroup(
       path.resolve('node_modules/.bin/wrangler'),
-      ['dev', '--port', String(SERVER_PORT)],
+      [
+        'dev',
+        '--port',
+        String(SERVER_PORT),
+        // Supplied on the command line rather than via .dev.vars so CI, which has no such file,
+        // can still exercise the room. Both are throwaway values scoped to this run.
+        '--var',
+        'ALLOW_DEV_SESSIONS:true',
+        '--var',
+        `SESSION_SECRET:${randomUUID()}`,
+      ],
       ['ignore', 'ignore', 'pipe'],
     );
     let serverStderr = '';
@@ -351,11 +1116,13 @@ async function main(): Promise<void> {
     check('at least one pack is built', packs.length > 0, packs.length);
 
     const firstPack = packs[0];
+    let characterIds: string[] = [];
     if (firstPack) {
       const manifest = await get(`${BASE_URL}/packs/${firstPack.id}/manifest.json`);
       checkEqual(`GET /packs/${firstPack.id}/manifest.json`, manifest.status, 200);
-      const parsed = (await manifest.json()) as { characters: unknown[]; tileCount: number };
+      const parsed = (await manifest.json()) as { characters: { id: string }[]; tileCount: number };
       checkEqual('manifest tileCount matches character count', parsed.characters.length, parsed.tileCount);
+      characterIds = parsed.characters.map((character) => character.id);
 
       const tile = await get(`${BASE_URL}/packs/${firstPack.id}/${firstPack.cover}`);
       checkEqual('cover tile status', tile.status, 200);
@@ -365,7 +1132,18 @@ async function main(): Promise<void> {
       checkEqual('cover tile via /.proxy', proxied.status, 200);
     }
 
-    console.log('\nBoard');
+    console.log('\nRoom (over the wire)');
+    await checkRoomProtocol();
+
+    if (firstPack) {
+      console.log('\nGame (over the wire)');
+      await checkGameProtocol(firstPack.id, characterIds);
+    }
+
+    console.log('\nCustom photo pack');
+    await checkCustomPack();
+
+    console.log('\nLobby (two browsers)');
     browser = spawnGroup(
       chrome,
       [
@@ -381,21 +1159,25 @@ async function main(): Promise<void> {
     );
 
     await waitFor('Chrome', async () => (await get(`http://127.0.0.1:${DEBUG_PORT}/json/version`)).ok);
-    const page = await connectCdp(`${BASE_URL}/`);
+    // Two pages, two dev users, one room — the milestone this phase is aiming at.
+    const instance = `e2e-${Date.now()}`;
+    const alice = await openPage(`${BASE_URL}/?user=alice&instance=${instance}`);
+    const bob = await openPage(`${BASE_URL}/?user=bob&instance=${instance}`);
 
-    // Creating the target and evaluating are racy: the execution context we first attach to can
-    // be about:blank, and it is torn down when the real navigation commits. Wait for the page to
-    // actually be ours and loaded before running anything against it.
-    await waitFor(
-      'the page to load',
-      async () =>
-        (await page.evaluate<boolean>(
-          `location.origin === ${JSON.stringify(BASE_URL)} && document.readyState === 'complete'`,
-        )) === true,
-    );
+    const lobby = await runLobbyFlow(alice, bob);
+    checkEqual('both players listed for alice', lobby.aliceSeesMembers, 2);
+    checkEqual('both players listed for bob', lobby.bobSeesMembers, 2);
+    check('alice joining Red shows up on bob’s screen', lobby.bobSeesAliceOnRed, lobby);
+    check('alice is marked leader of Red', lobby.aliceLeadsRed, lobby);
+    check('bob joining Blue shows up on alice’s screen', lobby.aliceSeesBobOnBlue, lobby);
+    check('host pack choice reaches bob', lobby.bobSeesPack, lobby);
+    check('start is disabled until everyone is ready', lobby.startDisabledBeforeReady, lobby);
+    check('bob has no start button (not host)', lobby.bobHasNoStart, lobby);
+    check('start enables once both are ready', lobby.startEnabledAfterReady, lobby);
+    check('starting the game moves bob out of the lobby too', lobby.bobLeftLobby, lobby);
 
-    const report = await page.evaluate<BoardReport>(BOARD_SCRIPT);
-    page.close();
+    console.log('\nBoard (in the started game)');
+    const report = await alice.evaluate<BoardReport>(BOARD_SCRIPT);
     if (!report) throw new Error('Board script returned nothing — the page may have failed to load');
 
     const expectedTiles = firstPack?.tileCount ?? 0;
@@ -433,6 +1215,45 @@ async function main(): Promise<void> {
     check('reset disables itself again', report.resetDisabledAfterReset);
 
     checkEqual('no broken tile images', report.brokenImages, 0);
+
+    console.log('\nGame (two browsers)');
+    const played = await runGameFlow(alice, bob);
+
+    check('the leader is shown a character', played.aliceSeesSecret);
+    check('each leader gets their own character', played.bobSeesDifferentSecret);
+    check('the marked tile matches the secret card', played.aliceSecretIsHers);
+    check('the waiting leader has nothing to submit', played.bobWaitsForRed);
+    check('the question reaches the other leader', played.bobGetsTheQuestion);
+    checkEqual('the answer shows in the asker’s log', played.aliceSeesAnswer, 'yes');
+    check('answering passes the turn to Blue', played.turnPassedToBlue);
+    check('Red can no longer ask once the turn passed', played.aliceHasNoAskBox);
+    check('naming a character asks for confirmation first', played.confirmAppears);
+    check('the guesser sees a result', played.bobSeesResult.length > 0, played.bobSeesResult);
+    check(
+      'both players see the same winner',
+      played.aliceSeesResult.split(' ')[0] === played.bobSeesResult.split(' ')[0],
+      played,
+    );
+    check('both characters are revealed on the board', played.bothRevealed);
+    check('a rematch puts everyone back in the lobby', played.rematchReturnsToLobby);
+
+    console.log('\nCustom photos (picked in the browser)');
+    const photoNames = ['Ada', 'Bram', 'Cleo', 'Dev', 'Elif', 'Fionn', 'Greta', 'Hugo', 'Ines', 'Jonas'];
+    const photos = await writeTestPhotos(photosDir, photoNames);
+    const uploaded = await runCustomPackUpload(alice, bob, photos);
+    alice.close();
+    bob.close();
+
+    checkEqual('the uploaded board has one tile per photo', uploaded.tileNames.length, photoNames.length);
+    checkEqual('filenames become the names on the board', uploaded.tileNames, photoNames);
+    check('the uploaded board is the one selected', uploaded.packName.includes(String(photoNames.length)), uploaded);
+    check('the built-in packs are still offered', uploaded.chipCount >= 3, uploaded.chipCount);
+    // Proves the whole round trip: encoded by Chrome, stored by the room, served back as WebP.
+    checkEqual('every uploaded photo renders', uploaded.brokenImages, 0);
+    check(
+      `photos fit the room’s cap (largest ${Math.round(uploaded.largestPhotoBytes / 1024)} KB of 128 KB)`,
+      uploaded.largestPhotoBytes > 0 && uploaded.largestPhotoBytes <= 128 * 1024,
+    );
   } finally {
     if (!(keepOpen && failures > 0)) await cleanup();
     else console.log(`\nLeaving the server up at ${BASE_URL} (--keep-open).`);
