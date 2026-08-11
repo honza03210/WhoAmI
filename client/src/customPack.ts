@@ -18,6 +18,7 @@ import {
 } from '../../server/protocol';
 import { displayNameFromFile, uniqueId } from '../../shared/naming';
 import { apiPath } from './discord';
+import { ZipError, isZip, readZip, type ZipEntry } from './zip';
 
 const TILE_SIZE = 256;
 const FULL_SIZE = 512;
@@ -37,7 +38,33 @@ const MIN_DIMENSION = 96;
 /** Leaves room under the room's per-photo cap for anything the encoder gets wrong. */
 const TARGET_BYTES = Math.floor(CUSTOM_PHOTO_MAX_BYTES * 0.75);
 
-export const ACCEPTED_TYPES = 'image/jpeg,image/png,image/webp,image/avif,image/gif';
+/**
+ * What a photo inside an archive is called, by extension.
+ *
+ * A zip entry has no MIME type of its own — only a name — so this is both the filter for which
+ * entries are photos and the type they are given on the way out.
+ */
+const PHOTO_TYPES: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  gif: 'image/gif',
+};
+
+// Three zip MIME types because that is how many browsers report between them, and `.zip` for the
+// ones that report nothing at all.
+export const ACCEPTED_TYPES =
+  'image/jpeg,image/png,image/webp,image/avif,image/gif,.zip,application/zip,application/x-zip-compressed';
+
+/**
+ * A photo out of an archive is held in memory until it has been encoded, where a picked one stays
+ * on disk — so an archive gets a budget that a selection from the file dialog does not need. It
+ * is also what stops a zip bomb: both are checked against the directory, before anything unpacks.
+ */
+const ZIP_PHOTO_MAX_BYTES = 32 * 1024 * 1024;
+const ZIP_TOTAL_MAX_BYTES = 256 * 1024 * 1024;
 
 export interface UploadProgress {
   /** Photos fully uploaded so far. */
@@ -48,6 +75,81 @@ export interface UploadProgress {
 }
 
 export class PackError extends Error {}
+
+export interface PhotoSelection {
+  files: File[];
+  /** What the board will be called: the archive or folder the photos came out of. */
+  name: string;
+}
+
+/**
+ * Turns whatever the picker handed back into a board's worth of photos.
+ *
+ * An archive is opened here, so nothing downstream ever learns that zips exist — ten photos out
+ * of a zip are the same ten photos as ten off the desktop, named the same way and encoded by the
+ * same code. Loose photos pass straight through, and a host who picks both gets both.
+ */
+export async function expandSelection(
+  picked: File[],
+  onProgress: (progress: UploadProgress) => void,
+): Promise<PhotoSelection> {
+  try {
+    const files: File[] = [];
+    const archives: File[] = [];
+
+    for (const file of picked) {
+      if (!(await isZip(file))) {
+        files.push(file);
+        continue;
+      }
+      archives.push(file);
+      // Spliced in where the archive sat, so a mixed selection keeps the order it was picked in.
+      files.push(...(await photosFromZip(file, onProgress)));
+    }
+
+    return { files, name: selectionName(picked, archives) };
+  } catch (error) {
+    // The host does not need to know which layer gave up; ZipError's messages are already
+    // written for them.
+    if (error instanceof ZipError) throw new PackError(error.message);
+    throw error;
+  }
+}
+
+/**
+ * Unpacks the photos out of one archive.
+ *
+ * Everything that can be judged from the directory is judged first — how many photos, how big
+ * they come out — because a host who zipped their whole photo library should be told so rather
+ * than made to wait while it decompresses.
+ */
+async function photosFromZip(archive: File, onProgress: (progress: UploadProgress) => void): Promise<File[]> {
+  const photos: { entry: ZipEntry; type: string }[] = [];
+  for (const entry of await readZip(archive)) {
+    const type = PHOTO_TYPES[entry.name.slice(entry.name.lastIndexOf('.') + 1).toLowerCase()];
+    if (type) photos.push({ entry, type });
+  }
+
+  if (photos.length === 0) throw new PackError(`There are no photos in ${archive.name}.`);
+  if (photos.length > CUSTOM_PACK_MAX) {
+    throw new PackError(
+      `${archive.name} holds ${photos.length} photos — a board takes at most ${CUSTOM_PACK_MAX}.`,
+    );
+  }
+
+  const huge = photos.find(({ entry }) => entry.size > ZIP_PHOTO_MAX_BYTES);
+  if (huge) throw new PackError(`${huge.entry.name} is too large to unpack.`);
+
+  const total = photos.reduce((sum, { entry }) => sum + entry.size, 0);
+  if (total > ZIP_TOTAL_MAX_BYTES) throw new PackError(`${archive.name} is too large to unpack.`);
+
+  const files: File[] = [];
+  for (const [index, { entry, type }] of photos.entries()) {
+    onProgress({ done: index, total: photos.length, label: `Unpacking ${entry.name}…` });
+    files.push(new File([await entry.read()], entry.name, { type }));
+  }
+  return files;
+}
 
 /**
  * Rejects a selection before any work is done on it, so the host gets one clear sentence rather
@@ -73,11 +175,12 @@ export function checkSelection(files: File[]): string | null {
  * a flaky connection loses one photo rather than the lot.
  */
 export async function uploadCustomPack(
-  files: File[],
+  selection: PhotoSelection,
   session: string,
   roomKey: string,
   onProgress: (progress: UploadProgress) => void,
 ): Promise<CustomPack> {
+  const { files } = selection;
   const problem = checkSelection(files);
   if (problem) throw new PackError(problem);
 
@@ -89,7 +192,7 @@ export async function uploadCustomPack(
   const extension = PACK_IMAGE_EXTENSION[format];
 
   const { token } = await postJson<{ token: string }>(`${base}/begin?${auth}`, {
-    name: packNameFrom(files),
+    name: selection.name,
   });
 
   const taken = new Set<string>();
@@ -122,11 +225,24 @@ export async function uploadCustomPack(
   return pack;
 }
 
-/** "Ada.jpg", "Bram.jpg" in a folder called "party" -> "party". Otherwise just "Custom". */
-function packNameFrom(files: File[]): string {
-  const relative = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath ?? '';
+/**
+ * What to call the board.
+ *
+ * "party.zip" -> "party", and "Ada.jpg", "Bram.jpg" picked out of a folder called "party" ->
+ * "party" as well. A selection that says nothing about where it came from — loose photos, or a
+ * zip alongside some strays — is just "Custom", which the host can live with.
+ */
+function selectionName(picked: File[], archives: File[]): string {
+  const [only] = archives;
+  if (only && picked.length === 1) {
+    return only.name.replace(/\.[^.]+$/, '').replace(/_+/g, ' ').trim() || 'Custom';
+  }
+
+  const first = picked[0];
+  if (!first || archives.length > 0) return 'Custom';
+  const relative = (first as File & { webkitRelativePath?: string }).webkitRelativePath ?? '';
   const folder = relative.split('/')[0] ?? '';
-  return folder && folder !== files[0]?.name ? folder : 'Custom';
+  return folder && folder !== first.name ? folder : 'Custom';
 }
 
 async function loadImage(file: File): Promise<ImageBitmap> {

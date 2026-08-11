@@ -4,7 +4,7 @@ import { CUSTOM_PACK_ID, CUSTOM_PACK_MAX, CUSTOM_PACK_MIN, TEAM_IDS, TEAM_NAMES 
 import type { PackSummary } from '../packs';
 import { avatarFor } from '../avatar';
 import type { UploadProgress } from '../customPack';
-import { ACCEPTED_TYPES, PackError, checkSelection, uploadCustomPack } from '../customPack';
+import { ACCEPTED_TYPES, PackError, checkSelection, expandSelection, uploadCustomPack } from '../customPack';
 
 interface LobbyProps {
   view: RoomView;
@@ -126,18 +126,21 @@ function PackPicker({
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const busy = progress !== null;
 
-  async function onPicked(files: File[]): Promise<void> {
-    const problem = checkSelection(files);
-    if (problem) {
-      onNotice(problem);
-      return;
-    }
-
-    setProgress({ done: 0, total: files.length, label: 'Reading photos…' });
+  async function onPicked(picked: File[]): Promise<void> {
+    // Progress goes up before the selection is checked, because a zip has to be opened before
+    // anyone can say how many photos it is.
+    setProgress({ done: 0, total: picked.length, label: 'Reading photos…' });
     try {
+      const selection = await expandSelection(picked, setProgress);
+      const problem = checkSelection(selection.files);
+      if (problem) {
+        onNotice(problem);
+        return;
+      }
+
       // The room publishes the board itself on commit, so there is no selectPack to follow up
       // with — the next state frame already has it in play.
-      await uploadCustomPack(files, session, roomKey, setProgress);
+      await uploadCustomPack(selection, session, roomKey, setProgress);
     } catch (error) {
       onNotice(error instanceof PackError ? error.message : `Upload failed: ${String(error)}`);
     } finally {
@@ -199,8 +202,8 @@ function PackPicker({
         </p>
       ) : (
         <p className="muted pack-hint">
-          {CUSTOM_PACK_MIN}–{CUSTOM_PACK_MAX} photos, resized in your browser. They live in this room only
-          and go when it is cleaned up. Filenames become the names on the board.
+          {CUSTOM_PACK_MIN}–{CUSTOM_PACK_MAX} photos, or a .zip of them, resized in your browser. They live
+          in this room only and go when it is cleaned up. Filenames become the names on the board.
         </p>
       )}
     </>

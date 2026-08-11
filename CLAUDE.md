@@ -109,10 +109,18 @@ model of guest play. **Never trust identity from the client frame.**
 
 - **Built-in**: `scripts/build-packs.ts` turns `packs/<name>/` into WebP tiles and manifests in
   `public/packs/`, shipped as static assets. Free, unmetered, same-origin.
-- **Custom**: the host picks 10–40 photos in the lobby; the browser crops and re-encodes them
-  (`client/src/customPack.ts`) and uploads via begin → add → commit to the room, which stores them
-  in DO storage (`server/customPack.ts`). Served under a random per-pack token, deleted when the
-  room is cleaned up.
+- **Custom**: the host picks 10–40 photos in the lobby — loose files, or a `.zip` of them; the
+  browser crops and re-encodes them (`client/src/customPack.ts`) and uploads via begin → add →
+  commit to the room, which stores them in DO storage (`server/customPack.ts`). Served under a
+  random per-pack token, deleted when the room is cleaned up.
+
+A zip is opened in the browser by `client/src/zip.ts` — a small stored/deflate reader over
+`DecompressionStream`, no dependency — and `expandSelection()` turns it into the same `File[]`
+the picker would have produced, so nothing past that point knows archives exist. Two things are
+load-bearing there: entries are **listed from the central directory and read lazily**, which is
+what lets an oversized archive or a zip bomb be refused before a byte is decompressed; and
+`__MACOSX/._name` forks, dotfiles and folder entries are dropped, because a Mac adds one fork
+per photo and they would otherwise double every board.
 
 `shared/naming.ts` derives character names and ids from filenames and is used by **both** paths,
 so ids stay identical. It must stay free of `node:path` — the client bundles it.
@@ -142,3 +150,7 @@ the active team's leader ask"). The e2e script covers three layers the unit test
 over real WebSockets (including frame-level redaction across five clients), the game through two
 real browsers, and the custom pack upload driven through an actual file input via CDP. Prefer
 adding to the right layer over duplicating a rule at every layer.
+
+`tests/zipFixture.ts` is a small zip **writer**, used both by `tests/zip.test.ts` and by
+`scripts/e2e.ts` — the one place a script imports from `tests/`. It is how malformed archives get
+tested without binary fixtures in the repo; it is not a `.test.ts`, so vitest ignores it.

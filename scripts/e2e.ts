@@ -13,10 +13,11 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { makeZip } from '../tests/zipFixture';
 
 const CHROME_CANDIDATES = [
   process.env['CHROME_PATH'],
@@ -1347,6 +1348,92 @@ async function writeTestPhotos(directory: string, names: string[]): Promise<stri
   );
 }
 
+/**
+ * Packs the same photos into an archive for the host to pick instead.
+ *
+ * Deflated rather than stored, so Chrome's `DecompressionStream` is actually exercised, and
+ * wrapped in the debris a real archive arrives with: a folder entry, the `__MACOSX/._name`
+ * resource forks that compressing a folder on a Mac silently adds, and a `.DS_Store`. Left in,
+ * those become tiles — so a board with exactly one tile per photo is the thing being proved.
+ */
+async function writeTestZip(directory: string, photos: string[]): Promise<string> {
+  const file = path.join(directory, 'Party trip.zip');
+
+  const sources = await Promise.all(
+    photos.map(async (photo) => ({
+      path: `Party trip/${path.basename(photo)}`,
+      data: new Uint8Array(await readFile(photo)),
+    })),
+  );
+
+  const junk = [
+    { path: 'Party trip/' },
+    { path: '.DS_Store', data: 'finder' },
+    ...photos.map((photo) => ({
+      path: `__MACOSX/Party trip/._${path.basename(photo)}`,
+      data: 'AppleDouble resource fork',
+    })),
+  ];
+
+  await writeFile(file, makeZip([...junk, ...sources]));
+  return file;
+}
+
+interface ZipUploadReport {
+  packName: string;
+  tileNames: string[];
+  brokenImages: number;
+}
+
+/**
+ * Repeats the upload from a zip, which is how a host who was sent an album gets it onto a board.
+ *
+ * The archive is opened in the browser, so this is the only coverage of client/src/zip.ts against
+ * a real `DecompressionStream` and a real file input. What it proves beyond the unit tests is
+ * that the photos come out the other end as a playable board: the same count, the same names in
+ * the same order, and every tile rendering.
+ */
+async function runZipUpload(
+  page: Awaited<ReturnType<typeof openPage>>,
+  other: Awaited<ReturnType<typeof openPage>>,
+  archive: string,
+): Promise<ZipUploadReport> {
+  const evalOn = <T,>(target: typeof page, body: string) =>
+    target.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
+
+  await evalOn<boolean>(page, RETURN_TO_LOBBY);
+
+  const document_ = (await page.call('DOM.getDocument', { depth: 0 })).result as { root: { nodeId: number } };
+  const input = (await page.call('DOM.querySelector', {
+    nodeId: document_.root.nodeId,
+    selector: 'input[type="file"]',
+  })).result as { nodeId: number };
+  await page.call('DOM.setFileInputFiles', { nodeId: input.nodeId, files: [archive] });
+
+  await evalOn<boolean>(page, `${AWAIT_UPLOAD} return true;`);
+
+  await evalOn<boolean>(other, `await wait(() => byText('button', "I'm ready")).then(b => b.click()); return true;`);
+
+  return evalOn<ZipUploadReport>(
+    page,
+    `const packName = document.querySelector('.chip.is-active').textContent.trim();
+     byText('button', "I'm ready").click();
+     await wait(() => !byText('button', 'Start game').disabled);
+     byText('button', 'Start game').click();
+     await wait(() => document.querySelectorAll('.tile').length > 0, 20000);
+
+     const images = [...document.querySelectorAll('.tile img')];
+     for (const img of images) img.loading = 'eager';
+     await wait(() => images.every(i => i.complete), 20000);
+
+     return {
+       packName,
+       tileNames: [...document.querySelectorAll('.tile-name')].map(el => el.textContent),
+       brokenImages: images.filter(i => i.naturalWidth === 0).length,
+     };`,
+  );
+}
+
 interface CustomUiReport {
   chipCount: number;
   packName: string;
@@ -1439,18 +1526,7 @@ async function runJpegFallbackUpload(
     target.evaluate<T>(`(async () => { ${PAGE_HELPERS} ${body} })()`);
 
   // End the game that the previous upload started, so the lobby is reachable again.
-  await evalOn<boolean>(
-    page,
-    `byText('.actions button', 'Guess their character').click();
-     await wait(() => document.querySelector('.board.is-guessing'));
-     document.querySelectorAll('.tile')[2].click();
-     await wait(() => document.querySelector('.confirm'));
-     byText('.confirm button', "Yes, that's them").click();
-     await wait(() => document.querySelector('.result'));
-     await wait(() => byText('button', 'Back to the lobby')).then(b => b.click());
-     await wait(() => document.querySelector('.teams'));
-     return true;`,
-  );
+  await evalOn<boolean>(page, RETURN_TO_LOBBY);
 
   await evalOn<boolean>(
     page,
@@ -1509,6 +1585,24 @@ async function runJpegFallbackUpload(
 const AWAIT_UPLOAD = `
   await wait(() => document.querySelector('.upload-progress'), 15000);
   await wait(() => !document.querySelector('.upload-progress'), 120000);
+`;
+
+/**
+ * Ends the game a previous upload started, so the pack picker is reachable again.
+ *
+ * Each upload section leaves a game running — the board is the only place an uploaded photo is
+ * actually rendered — and the next one has to get back to the lobby before it can pick anything.
+ */
+const RETURN_TO_LOBBY = `
+  byText('.actions button', 'Guess their character').click();
+  await wait(() => document.querySelector('.board.is-guessing'));
+  document.querySelectorAll('.tile')[2].click();
+  await wait(() => document.querySelector('.confirm'));
+  byText('.confirm button', "Yes, that's them").click();
+  await wait(() => document.querySelector('.result'));
+  await wait(() => byText('button', 'Back to the lobby')).then(b => b.click());
+  await wait(() => document.querySelector('.teams'));
+  return true;
 `;
 
 const GAME_HELPERS = `
@@ -1783,6 +1877,16 @@ async function main(): Promise<void> {
       `photos fit the room’s cap (largest ${Math.round(uploaded.largestPhotoBytes / 1024)} KB of 128 KB)`,
       uploaded.largestPhotoBytes > 0 && uploaded.largestPhotoBytes <= 128 * 1024,
     );
+
+    console.log('\nCustom photos (from a zip archive)');
+    const zipped = await runZipUpload(alice, bob, await writeTestZip(photosDir, photos));
+
+    checkEqual('the archive unpacks into a whole board', zipped.tileNames.length, photoNames.length);
+    // The archive also holds a folder entry, a .DS_Store and one __MACOSX fork per photo; a tile
+    // per photo and no more is what says they were dropped.
+    checkEqual('names and order survive the archive', zipped.tileNames, photoNames);
+    check('the board is named after the archive', zipped.packName.startsWith('Party trip'), zipped.packName);
+    checkEqual('every unpacked photo renders', zipped.brokenImages, 0);
 
     console.log('\nCustom photos (browser without WebP encoding)');
     const fallback = await runJpegFallbackUpload(alice, bob, photos);
